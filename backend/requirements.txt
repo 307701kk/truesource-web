@@ -1,0 +1,4 @@
+fastapi>=0.110
+uvicorn>=0.29
+duckdb>=1.0
+openpyxl>=3.1

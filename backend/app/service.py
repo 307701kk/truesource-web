@@ -1,0 +1,278 @@
+"""Scan orchestration: runs a scan in a background thread and exposes progress + results."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import logging
+import threading
+from datetime import datetime
+from pathlib import Path
+
+from . import catalog, config
+from .converter import check_archive, convert_workbook, uncached_formula_cells
+from .scanner import ScanListing, ScanPathError, list_excel_files, validate_scan_path
+from .store import Store
+
+log = logging.getLogger("truesource.scan")
+
+__all__ = ["ScanBusyError", "ScanPathError", "ScanService"]
+
+MAX_REPORTED = 50
+
+
+class ScanBusyError(RuntimeError):
+    """A scan is already running."""
+
+
+def _fmt_time(ts: datetime | None) -> str | None:
+    return ts.isoformat(timespec="seconds") if ts else None
+
+
+class ScanService:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self.store: Store | None = None  # last completed scan
+        self._scan_id = 0
+        self._status = self._blank_status()
+        self.scanned_path: str | None = None
+
+    @staticmethod
+    def _blank_status() -> dict:
+        return {
+            "state": "idle",
+            "scan_id": 0,
+            "path": None,
+            "files_total": 0,
+            "files_done": 0,
+            "percent": 0,
+            "current_file": None,
+            "sheets": 0,
+            "data_rows": 0,
+            "skipped": {},
+            "warnings": [],
+            "errors": [],
+            "started_at": None,
+            "finished_at": None,
+            "message": None,
+        }
+
+    # ------------------------------------------------------------ control
+    def start(self, raw_path: str, *, background: bool = True) -> dict:
+        root = validate_scan_path(raw_path)  # raises ScanPathError
+        with self._lock:
+            if self._status["state"] == "running":
+                raise ScanBusyError("이미 스캔이 진행 중입니다.")
+            self._scan_id += 1
+            self._status = self._blank_status()
+            self._status.update(
+                state="running",
+                scan_id=self._scan_id,
+                path=str(root),
+                started_at=_fmt_time(datetime.now()),
+            )
+            scan_id = self._scan_id
+        if background:
+            self._thread = threading.Thread(
+                target=self._run, args=(root, scan_id), daemon=True, name="scan"
+            )
+            self._thread.start()
+        else:
+            self._run(root, scan_id)
+        return self.status()
+
+    def wait(self, timeout: float | None = None) -> None:
+        if self._thread:
+            self._thread.join(timeout)
+
+    def status(self) -> dict:
+        with self._lock:
+            s = dict(self._status)
+            s["skipped"] = dict(s["skipped"])
+            s["warnings"] = list(s["warnings"])
+            s["errors"] = list(s["errors"])
+            return s
+
+    def _update(self, **kw) -> None:
+        with self._lock:
+            self._status.update(kw)
+
+    def _warn(self, msg: str) -> None:
+        with self._lock:
+            if len(self._status["warnings"]) < MAX_REPORTED:
+                self._status["warnings"].append(msg)
+
+    def _error(self, rel: str, msg: str) -> None:
+        with self._lock:
+            if len(self._status["errors"]) < MAX_REPORTED:
+                self._status["errors"].append({"file": rel, "message": msg})
+
+    # ------------------------------------------------------------ the scan
+    def _run(self, root: Path, scan_id: int) -> None:
+        try:
+            listing = list_excel_files(root)
+            self._update(files_total=len(listing.files), skipped=dict(listing.skipped))
+            for w in listing.warnings:
+                self._warn(w)
+            store = self._load(listing)
+            with self._lock:
+                self.store = store
+                self.scanned_path = str(root)
+                self._status.update(
+                    state="done",
+                    percent=100,
+                    current_file=None,
+                    finished_at=_fmt_time(datetime.now()),
+                )
+        except Exception as exc:  # never let the thread die silently
+            log.exception("scan failed")
+            self._update(
+                state="error",
+                finished_at=_fmt_time(datetime.now()),
+                message=f"스캔 중 오류: {exc.__class__.__name__}",
+            )
+
+    def _load(self, listing: ScanListing) -> Store:
+        store = Store()
+        facts: list[catalog.FileFacts] = []
+        total_sheets = total_rows = 0
+        for i, f in enumerate(listing.files, start=1):
+            self._update(current_file=f.rel_path)
+            modified = datetime.fromtimestamp(f.mtime)
+            name = f.rel_path.rsplit("/", 1)[-1]
+            common = dict(
+                rel_path=f.rel_path,
+                name=name,
+                dept=catalog.classify_department(f.rel_path),
+                top_folder=catalog.top_folder(f.rel_path),
+                size=f.size,
+                modified=modified,
+            )
+            if total_rows >= config.MAX_TOTAL_ROWS:
+                msg = f"한 번에 읽을 수 있는 행 수({config.MAX_TOTAL_ROWS:,})를 넘어 건너뜀"
+                store.add_file(sha256=None, status="error", error=msg, **common)
+                self._error(f.rel_path, msg)
+                self._update(files_done=i, percent=int(i * 100 / len(listing.files)))
+                continue
+            try:
+                data = (
+                    f.abs_path.read_bytes()
+                )  # one read: the hash and the parse see the same bytes
+                digest = hashlib.sha256(data).hexdigest()
+                check_archive(io.BytesIO(data))
+                uncached = uncached_formula_cells(io.BytesIO(data))
+                sheets = convert_workbook(io.BytesIO(data))
+                del data
+            except Exception as exc:
+                msg = f"{exc.__class__.__name__}: {str(exc)[:150]}"
+                store.add_file(sha256=None, status="error", error=msg, **common)
+                self._error(f.rel_path, msg)
+            else:
+                file_id = store.add_file(sha256=digest, **common)
+                if uncached:
+                    self._warn(
+                        f"{f.rel_path}: 계산값이 저장되지 않은 수식 {uncached}개는 빈 값으로 처리됨"
+                        " (엑셀에서 열어 저장하면 해결)"
+                    )
+                rows = loaded = 0
+                failed: list[str] = []
+                for sh in sheets:
+                    try:
+                        store.add_sheet(file_id, sh)
+                    except Exception as exc:
+                        log.exception("sheet failed: %s [%s]", f.rel_path, sh.sheet_name)
+                        failed.append(sh.sheet_name)
+                        self._error(f.rel_path, f"[{sh.sheet_name}] {exc.__class__.__name__}")
+                        continue
+                    loaded += 1
+                    rows += sh.n_data_rows
+                    self._sheet_warnings(f.rel_path, sh)
+                if failed:
+                    store.finish_file(
+                        file_id,
+                        loaded,
+                        rows,
+                        status="partial",
+                        error=f"일부 시트를 읽지 못함: {', '.join(failed)}"[:200],
+                    )
+                else:
+                    store.finish_file(file_id, loaded, rows)
+                total_sheets += loaded
+                total_rows += rows
+                preamble = next((s.preamble for s in sheets if s.preamble), [])
+                facts.append(catalog.FileFacts(f.rel_path, name, modified, digest, preamble))
+            self._update(
+                files_done=i,
+                sheets=total_sheets,
+                data_rows=total_rows,
+                percent=int(i * 100 / max(len(listing.files), 1)),
+            )
+        for rel, info in catalog.assign_freshness(facts).items():
+            store.set_freshness(rel, info["fresh"], info["copy_of"], info["data_date"])
+        return store
+
+    def _sheet_warnings(self, rel: str, sh) -> None:
+        if sh.truncated:
+            self._warn(f"{rel} [{sh.sheet_name}]: {config.MAX_ROWS_PER_SHEET}행 이후는 읽지 않음")
+        if sh.error_cells:
+            self._warn(f"{rel} [{sh.sheet_name}]: 엑셀 오류 셀 {sh.error_cells}개를 빈 값으로 처리")
+        if sh.mixed_columns:
+            self._warn(
+                f"{rel} [{sh.sheet_name}]: 자료형이 섞인 열 {sh.mixed_columns} (문자열로 저장)"
+            )
+
+    # ------------------------------------------------------------ results
+    def _snapshot(self) -> tuple[Store | None, str | None, dict]:
+        """store, scanned_path and status taken together, so they belong to the same scan."""
+        with self._lock:
+            status = dict(self._status)
+            status["skipped"] = dict(status["skipped"])
+            return self.store, self.scanned_path, status
+
+    def catalog(self) -> dict:
+        store, scanned_path, status = self._snapshot()
+        return self._catalog_from(store, scanned_path, status)
+
+    @staticmethod
+    def _catalog_from(store: Store | None, scanned_path: str | None, status: dict) -> dict:
+        base = {
+            "state": status["state"],
+            "scanned_path": scanned_path,
+            "departments": [*config.KNOWN_DEPARTMENTS, config.UNCLASSIFIED],
+            "skipped": status["skipped"],
+            "total": 0,
+            "files": [],
+        }
+        if store is None:
+            return base
+        files = []
+        for f in store.files():
+            files.append(
+                {
+                    "id": f["file_id"],
+                    "name": f["name"],
+                    "path": f["rel_path"],
+                    "dept": f["dept"],
+                    "top_folder": f["top_folder"],
+                    "modified": f["modified"].strftime("%Y-%m-%d %H:%M"),
+                    "size": f["size"],
+                    "sheets": f["sheet_count"],
+                    "rows": f["data_rows"],
+                    "fresh": f["fresh"],
+                    "copy_of": f["copy_of"],
+                    "data_date": f["data_date"],
+                    "error": f["error"],
+                }
+            )
+        base.update(total=len(files), files=files)
+        return base
+
+    def file_detail(self, file_id: int) -> dict | None:
+        store, scanned_path, status = self._snapshot()
+        if store is None:
+            return None
+        for f in self._catalog_from(store, scanned_path, status)["files"]:
+            if f["id"] == file_id:
+                return {**f, "sheet_list": store.sheets_of(file_id)}
+        return None
