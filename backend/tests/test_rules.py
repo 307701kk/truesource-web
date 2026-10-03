@@ -618,3 +618,27 @@ def test_normal_business_text_is_not_flagged(text):
     from app.agent.gateway import _INJECTION
 
     assert not _INJECTION.search(text)
+
+
+def _typed(question_type: str, claim):
+    def policy(step, r, contents):
+        return [("final_answer", {"question_type": question_type, "answer": "끝", "claim": claim})]
+
+    return policy
+
+
+def test_question_type_follows_the_llm_not_a_stray_claim(tmp_path):
+    from app.agent.runner import Agent
+    from tests.test_agent import ScriptedGateway
+
+    root = tmp_path / "s"
+    make(root, "영업팀/실적.xlsx", {"팀별실적": perf(month_rows())})
+    svc = scan(root)
+    claim = {"statement": "x", "verdict": "맞음", "checks": []}
+    user = {"name": "홍", "company": "c"}
+    plain = Agent(svc, ScriptedGateway(_typed("질문형", claim))).ask("질문", user)
+    assert plain["type"] == "질문형" and plain["claim"] is None
+    verify = Agent(svc, ScriptedGateway(_typed("검증형", claim))).ask("검증", user)
+    assert verify["type"] == "검증형" and verify["claim"]["verdict"] == "맞음"
+    missing = Agent(svc, ScriptedGateway(_typed("검증형", None))).ask("검증", user)
+    assert missing["type"] == "질문형"  # no claim table -> cannot render a verification
