@@ -66,7 +66,7 @@ class AuditMixin:
         return d
 
     # ------------------------------------------------------------------ file level
-    def file_audit(self, meta: dict) -> None:
+    def file_audit(self, meta: dict, check_period: bool = True) -> None:
         ctx = self.ctx
         fl = ctx.flag
         key = meta["table"]
@@ -112,7 +112,7 @@ class AuditMixin:
                 gap = 0
             if gap > LATE_EDIT_DAYS:
                 fl("V4", loc, data_date=meta["data_date"], gap=gap)
-            period = ctx.period
+            period = ctx.period if check_period else None
             if period:
                 years = set(YEAR.findall(f"{title} {meta['file']} {meta['path']}"))
                 if years and str(period["year"]) not in years:

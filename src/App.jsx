@@ -94,11 +94,11 @@ export default function App() {
 
   // 이번 답변에서 쓰인 파일 이름들 (사이드바 상단 고정용)
   const usedFiles = useMemo(() => {
-    const names = [
-      ...(result?.sources ?? []).map((s) => s.file),
-      ...(result?.search_results ?? []).map((s) => s.file),
+    const paths = [
+      ...(result?.sources ?? []).map((s) => s.path),
+      ...(result?.search_results ?? []).map((s) => s.path),
     ]
-    return new Set(names)
+    return new Set(paths.filter(Boolean))
   }, [result])
 
   if (booting) return null

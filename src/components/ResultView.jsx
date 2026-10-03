@@ -29,7 +29,7 @@ export default function ResultView({ data, onAsk }) {
             <ConfidenceGauge confidence={data.confidence} reason={data.confidence_reason} signals={data.confidence_signals} />
           )}
           <WarningsCard warnings={data.warnings} />
-          <TraceList trace={data.trace} />
+          <TraceList trace={data.trace} timing={data.timing} />
         </aside>
       </div>
     </div>
