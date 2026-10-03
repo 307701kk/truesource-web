@@ -39,3 +39,6 @@ export const deleteHistory = (company, id) => request(`/api/history/${id}?${qs({
 export const getGlossary = (company) => request(`/api/glossary?${qs({ company })}`)
 export const saveGlossary = (entry) => request('/api/glossary', json('POST', entry))
 export const deleteGlossary = (company, id) => request(`/api/glossary/${id}?${qs({ company })}`, { method: 'DELETE' })
+
+// 근거 파일을 이 PC의 엑셀로 연다 (분석된 파일만 가능)
+export const openFile = (path) => request('/api/open', json('POST', { path }))

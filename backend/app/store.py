@@ -92,6 +92,9 @@ class Store:
     def __init__(self) -> None:
         self.con = duckdb.connect(":memory:")
         self.lock = threading.Lock()
+        self.file_info: dict[
+            str, dict
+        ] = {}  # rel_path -> extra facts (tie_with, newer, locked, uncached)
         self._next_file_id = 1
         self._next_table = 1
         for ddl in _DDL:

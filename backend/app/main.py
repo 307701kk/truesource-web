@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -17,6 +17,7 @@ from . import config  # noqa: E402
 from .agent.gateway import Gateway, GatewayError, LLMNotConfigured  # noqa: E402
 from .agent.runner import Agent  # noqa: E402
 from .companydb import CompanyManager  # noqa: E402
+from .opener import OpenError, open_file  # noqa: E402
 from .service import ScanBusyError, ScanPathError, ScanService  # noqa: E402
 
 
@@ -238,3 +239,23 @@ def glossary_delete(gid: int, company: str) -> dict:
 def scan_log(company: str, limit: int = 20) -> dict:
     """Sync log of the company: one row per scan with 추가/수정/삭제/이동 counts."""
     return {"items": _company(company).scan_logs(min(max(limit, 1), 100))}
+
+
+class OpenRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/open")
+def open_excel(req: OpenRequest, request: Request) -> dict:
+    """Open a scanned workbook in the user's own Excel. Only this machine may ask, and only for
+    files the scan has seen."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost", "testclient"):
+        raise HTTPException(status_code=403, detail="이 PC에서만 파일을 열 수 있습니다.")
+    store = service.store
+    known = {r[0] for r in store.query("SELECT rel_path FROM files")} if store else set()
+    try:
+        opened = open_file(service.scanned_path, req.path, known)
+    except OpenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "opened": opened.name}

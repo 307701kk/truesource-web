@@ -230,7 +230,7 @@ class Agent:
             raise GatewayError("먼저 공유폴더를 분석하세요.")
         sess = self._session(session_id, user, store)
         ctx = QuestionCtx(question=question, indexed_at=self.service.status().get("finished_at"))
-        tools = ToolBox(store, ctx, glossary)
+        tools = ToolBox(store, ctx, glossary, root=self.service.scanned_path)
         qid = uuid.uuid4().hex[:8]
         sess.user = user
         turn: list[types.Content] = [types.Content(role="user", parts=[types.Part(text=question)])]
@@ -270,6 +270,8 @@ class Agent:
         nudges = 0
         for _ in range(config.MAX_TOOL_CALLS + config.MAX_NUDGES + config.MAX_NUMBER_RETRIES + 4):
             only_final = ctx.calls >= config.MAX_TOOL_CALLS
+            if only_final:
+                ctx.budget_hit = True  # the investigation was cut short by the call limit
             reply = self.gateway.call_llm(
                 purpose="plan_and_answer",
                 contents=[*sess.history, *turn],
@@ -283,6 +285,7 @@ class Agent:
             if not calls:  # plain text instead of a tool call: push it back to the tool protocol
                 nudges += 1
                 if nudges > config.MAX_NUDGES:
+                    ctx.unstructured = True
                     ctx.final = {
                         "question_type": "질문형",
                         "answer": " ".join(p.text or "" for p in reply.parts).strip()
@@ -310,6 +313,7 @@ class Agent:
             if ctx.ask or (ctx.final and not ctx.final.get("_rejected")):
                 return
         if ctx.final is None or ctx.final.get("_rejected"):
+            ctx.unstructured = True
             ctx.final = {
                 "question_type": "질문형",
                 "answer": "정해진 단계 안에 답을 완성하지 못했습니다.",
@@ -361,6 +365,7 @@ class Agent:
             return {
                 "error": f"답변 속 숫자 {', '.join(bad)} 가 도구 결과에 없습니다. 도구가 준 값(display)만 그대로 인용해 다시 final_answer 하세요."
             }
+        ctx.bad_numbers = bad
         ctx.number_check = "failed" if bad else ("ok" if ctx.queries else "none")
         ctx.final = args
         ctx.step(
@@ -395,23 +400,25 @@ class Agent:
                 "confidence_reason": None,
             }
         final = ctx.final or {}
-        for t in {
-            q["table"] for q in ctx.queries.values()
-        }:  # data quality of everything that was used
-            tools.note_quality(tools.quality_of(t))
-        ctx.quality_notes[:] = list(dict.fromkeys(ctx.quality_notes))
+        ctx.no_data = self._detect_no_data(ctx)
         conf = confidence.evaluate(ctx)
         qtype = final.get("question_type", "질문형")
         if ctx.searched and not ctx.queries:
             qtype = "찾기형"
         elif final.get("claim"):
             qtype = "검증형"
+        answer = final.get("answer", "")
+        if ctx.no_data:
+            qtype, answer = "내용없음", "관련 내용을 찾지 못했습니다. " + ctx.no_data["reason"]
         out = base | {
             "type": qtype,
-            "answer": final.get("answer", ""),
+            "answer": answer,
             "confidence": conf["level"],
             "confidence_reason": conf["reason"],
             "confidence_signals": conf["signals"],
+            "warnings": conf["warnings"],
+            "check_message": conf["check_message"],
+            "no_data": ctx.no_data,
             "number_check": ctx.number_check,
         }
         if final.get("comparison"):
@@ -420,26 +427,113 @@ class Agent:
             out["cause"] = final["cause"]
         if final.get("claim"):
             out["claim"] = final["claim"]
-        if ctx.sources:
+        sources = [*ctx.sources, *self._hit_sources(ctx)]
+        if sources and not ctx.no_data:
             seen, srcs = set(), []
-            for s in ctx.sources:
-                key = (s["file"], s["sheet"], s["row"])
+            for src in sources:
+                key = (src["path"], src["sheet"], src["row"], src["role"])
                 if key not in seen:
                     seen.add(key)
-                    srcs.append(s)
+                    srcs.append(src)
             out["sources"] = srcs
         if qtype == "찾기형" and ctx.search_hits:
             out["search_results"] = [
                 {
                     "file": h["file"],
+                    "path": h["path"],
                     "location": f"{h['dept']} / {h['sheet']}",
+                    "cell": f"{h['letter']}{h['first_rows'][0]}",
+                    "rows": self._hit_rows(h),
                     "modified": f"{h['modified']} 수정",
                     "snippet": h["snippet"],
+                    "fresh": h["fresh"],
+                    "editing": self.service.store.file_info.get(h["path"], {}).get("locked"),
                     "relevance": "높음" if h["fresh"] == "ok" and h["exact"] else "보통",
                 }
                 for h in ctx.search_hits[:8]
             ]
         return out
+
+    @staticmethod
+    def _hit_rows(h: dict) -> str:
+        more = h["hits"] - len(h["first_rows"])
+        return ", ".join(f"{r}행" for r in h["first_rows"]) + (f" 외 {more}곳" if more > 0 else "")
+
+    def _hit_sources(self, ctx: QuestionCtx) -> list[dict]:
+        """Evidence entries for value-search hits (file, sheet, rows, column letter)."""
+        info = self.service.store.file_info
+        return [
+            {
+                "file": h["file"],
+                "path": h["path"],
+                "sheet": h["sheet"],
+                "row": self._hit_rows(h),
+                "row_count": h["hits"],
+                "cells": f"{h['letter']}열({h['column']})",
+                "modified": h["modified"],
+                "indexed": ctx.indexed_at,
+                "fresh": h["fresh"],
+                "editing": info.get(h["path"], {}).get("locked"),
+                "role": "값이 있는 위치",
+                "query_id": None,
+            }
+            for h in ctx.search_hits[:8]
+        ]
+
+    def _detect_no_data(self, ctx: QuestionCtx) -> dict | None:
+        """Nothing relevant in the analysed files: say so, say what was tried and what to do."""
+        if ctx.ask or ctx.final is None:
+            return None
+        if any(q["rows_used"] > 0 for q in ctx.queries.values()) or ctx.search_hits:
+            return None
+        looked = ctx.queries or ctx.value_searches or ctx.catalog_searches
+        if not looked:
+            return None  # answered without looking at any file: rule S1 reports that
+        reasons, tried = [], []
+        for v in ctx.value_searches:
+            tried.append(f"값 검색: '{v['text']}'")
+        if ctx.value_searches:
+            reasons.append(
+                "'"
+                + "', '".join(v["text"] for v in ctx.value_searches)
+                + "' 이(가) 들어 있는 파일이 없습니다."
+            )
+        for c in ctx.catalog_searches:
+            tried.append(f"카탈로그 검색: {', '.join(c['columns'])} → {c['found']}개 파일")
+        if ctx.queries:
+            tried += [
+                f"집계: {q['file']} [{q['sheet']}] → 해당 행 0개" for q in ctx.queries.values()
+            ]
+            reasons.append("조건(기간·이름)에 맞는 데이터 행이 없습니다.")
+        elif ctx.catalog_searches and not ctx.value_searches:
+            cols = ", ".join(dict.fromkeys(c for s in ctx.catalog_searches for c in s["columns"]))
+            reasons.append(f"필요한 컬럼({cols})을 가진 파일이 분석 대상에 없습니다.")
+        st = self.service.status()
+        skipped = st["skipped"]
+        labels = {
+            "unsupported_xls": ".xls(구형식) 파일",
+            "too_large": "용량이 큰 파일",
+            "unreadable": "읽을 수 없는 파일",
+        }
+        not_analyzed = [f"{labels[k]} {n}개" for k, n in skipped.items() if k in labels and n]
+        if st["errors"]:
+            not_analyzed.append(f"읽기 오류가 난 파일 {len(st['errors'])}개")
+        store = self.service.store
+        n_files = store.query("SELECT count(*) FROM files WHERE status IN ('ok','partial')")[0][0]
+        tips = [
+            "이름·기간을 바꿔 다시 질문해 보세요 (예: 정확한 팀명·거래처명).",
+            "우리 회사만 쓰는 표현이면 '용어사전'에 등록해 보세요.",
+            "찾는 자료가 공유폴더에 새로 들어왔다면 폴더를 다시 분석하세요.",
+        ]
+        if any("xls" in n for n in not_analyzed):
+            tips.append(".xls 파일은 .xlsx로 저장하면 분석됩니다.")
+        return {
+            "reason": " ".join(reasons) or "분석된 파일에서 관련 내용을 찾지 못했습니다.",
+            "tried": tried,
+            "coverage": f"분석된 파일 {n_files}개 안에서 찾았습니다.",
+            "not_analyzed": not_analyzed,
+            "tips": tips,
+        }
 
     def _remember(self, sess: Session, question: str, resp: dict) -> None:
         """Keep a compact transcript so follow-ups ('그럼 2위는?') work without resending tool results."""
