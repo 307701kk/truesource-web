@@ -411,8 +411,13 @@ class Agent:
         qtype = final.get("question_type", "질문형")
         if ctx.searched and not ctx.queries:
             qtype = "찾기형"
-        elif final.get("claim"):
-            qtype = "검증형"
+        elif qtype == "검증형" and not final.get("claim"):
+            qtype = "질문형"  # a verification answer needs the claim table the screen is built on
+        elif qtype != "검증형":
+            final = {
+                **final,
+                "claim": None,
+            }  # a claim on a plain question is noise: do not turn it into 검증형
         answer = final.get("answer", "")
         if ctx.no_data:
             qtype, answer = "내용없음", "관련 내용을 찾지 못했습니다. " + ctx.no_data["reason"]
