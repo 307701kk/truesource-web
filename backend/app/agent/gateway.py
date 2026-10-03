@@ -253,6 +253,7 @@ class Gateway:
         self.audit = audit or AuditLog()
         self._client: genai.Client | None = None
         self._check: dict | None = None
+        self._tl = threading.local()  # seconds this thread spent waiting for rate limits
 
     def configured(self) -> bool:
         return bool(config.gemini_api_key())
@@ -345,10 +346,18 @@ class Gateway:
                 last = exc
                 code = getattr(exc, "code", None)
                 if code in (429, 500, 503) and attempt < MAX_ATTEMPTS - 1:
-                    time.sleep(self._retry_wait(exc, attempt))
+                    wait = self._retry_wait(exc, attempt)
+                    self._tl.wait = getattr(self._tl, "wait", 0.0) + wait
+                    time.sleep(wait)
                     continue
                 raise classify_api_error(exc) from exc  # key / model / quota errors stop at once
         raise GatewayError("Gemini API 호출에 실패했습니다.") from last
+
+    def pop_wait(self) -> float:
+        """Seconds spent waiting since the last call (rate limits / busy server); resets to 0."""
+        w = getattr(self._tl, "wait", 0.0)
+        self._tl.wait = 0.0
+        return w
 
     # ---------------------------------------------------------------- key check
     def check(self, *, force: bool = False) -> dict:

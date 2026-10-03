@@ -15,6 +15,11 @@ export default function NoDataLayout({ data }) {
           </div>
         </div>
       </Card>
+      {nd.similar_names?.length > 0 && (
+        <Card title="비슷한 이름은 있습니다 (같은 대상이 아닐 수 있습니다)">
+          <ul className="plain">{nd.similar_names.map((t) => <li key={t}>{t}</li>)}</ul>
+        </Card>
+      )}
       {nd.tried.length > 0 && (
         <Card title="찾아본 곳">
           <ul className="plain">{nd.tried.map((t) => <li key={t}>{t}</li>)}</ul>

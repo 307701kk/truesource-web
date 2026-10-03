@@ -40,11 +40,15 @@ def allowed_numbers(tool_results: list[dict], question: str) -> set[float]:
     return allowed | {round(v / 1e8, 4) for v in allowed} | {round(v / 1e4, 4) for v in allowed}
 
 
+def _readable(v: float) -> str:
+    return f"{v:,.2f}".rstrip("0").rstrip(".")
+
+
 def check(texts: list[str], allowed: set[float]) -> list[str]:
-    """Return the figures that cannot be traced to a tool result."""
+    """Return the figures that cannot be traced to a tool result (in a form people can read)."""
     bad = []
     for t in texts:
         for v in sorted(numbers_in(t or "", strict=True)):
             if v not in allowed:
-                bad.append(f"{v:g}")
+                bad.append(_readable(v))
     return sorted(set(bad))

@@ -47,6 +47,42 @@ GLOSSARY: list[dict] = [
     },
     {"term": "계약금액", "columns": ["계약금액"], "synonyms": ["계약액"], "note": ""},
     {
+        "term": "품목",
+        "columns": ["품목명", "품목", "품목코드"],
+        "synonyms": ["제품", "상품", "아이템", "자재"],
+        "note": "",
+    },
+    {
+        "term": "창고",
+        "columns": ["창고"],
+        "synonyms": ["보관창고", "물류창고"],
+        "note": "재고현황은 창고별 시트로 나뉘어 있어 합쳐서 집계(also_tables)해야 전체 재고가 됩니다",
+    },
+    {
+        "term": "입고",
+        "columns": ["입고", "입고수량", "반품입고"],
+        "synonyms": ["입고량"],
+        "note": "",
+    },
+    {
+        "term": "출고",
+        "columns": ["출고"],
+        "synonyms": ["출고량"],
+        "note": "",
+    },
+    {
+        "term": "수주일",
+        "columns": ["수주일"],
+        "synonyms": ["주문일", "오더일"],
+        "note": "",
+    },
+    {
+        "term": "결제조건",
+        "columns": ["결제조건"],
+        "synonyms": ["결제", "지급조건"],
+        "note": "",
+    },
+    {
         "term": "납품실적",
         "columns": ["1분기 납품실적", "2분기 납품실적", "3분기 납품실적", "4분기 납품실적"],
         "synonyms": ["납품"],
@@ -143,3 +179,10 @@ def parse_period(text: str, latest_year: int) -> dict | None:
         "year_defaulted": default_year,
         "months": [f"{mm}월" for mm in range(start.month, end.month + 1)],
     }
+
+
+def standard_terms_of(column: str | None) -> set[str]:
+    """Which standard terms (지표) a column name belongs to. Empty if the column is not in the glossary."""
+    if not column:
+        return set()
+    return {g["term"] for g in GLOSSARY if column in g["columns"]}

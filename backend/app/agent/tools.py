@@ -14,7 +14,7 @@ from datetime import date
 from openpyxl.utils import get_column_letter
 
 from .. import catalog, config
-from ..store import Store, quote_ident
+from ..store import Store, normalize_value, quote_ident
 from . import glossary, rules
 from .audits import EXCERPT, AuditMixin
 
@@ -36,8 +36,6 @@ ID_COLUMNS = {
     "수주번호",
     "발주번호",
     "계약번호",
-    "거래처코드",
-    "품목코드",
     "No",
 }
 AGGS = {
@@ -49,6 +47,18 @@ AGGS = {
     "count_distinct": "COUNT(DISTINCT",
 }
 OPS = {"=", "!=", ">", ">=", "<", "<=", "in", "contains", "between"}
+NUMERIC_TYPES = ("BIGINT", "INTEGER", "DOUBLE", "DECIMAL")
+MAX_UNION_TABLES = 40
+_RANKING = re.compile(
+    r"\d+\s*(?:위|등)|1\s*등|가장|제일|최고|최대|최저|최소|상위|하위|순위|랭킹|top\s*\d*", re.I
+)
+MIN_RANK_ITEMS = 3  # a ranking can only be checked on several items, not on the winner alone
+# metrics that describe the same thing recorded at different points (shipped vs invoiced)
+RELATED_METRICS = [{"매출실적", "납품실적"}]
+# stock numbers (a level at a date) can never be added across dates or files
+STOCK_COLUMNS = {"기말재고", "기초재고", "안전재고", "전월잔액", "당월잔액"}
+_DAY_DATE = re.compile(r"\d{1,2}\s*월\s*\d{1,2}\s*일|\d{4}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{1,2}")
+_FIGURE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:억|만원|원)")
 
 
 @dataclass
@@ -79,7 +89,15 @@ class QuestionCtx:
     unregistered: list[str] = field(default_factory=list)
     no_data: dict | None = None  # set by the runner when nothing relevant was found
     catalog_searches: list[dict] = field(default_factory=list)  # [{columns, found}]
-    value_searches: list[dict] = field(default_factory=list)  # [{text, found}]
+    value_searches: list[dict] = field(default_factory=list)  # [{text, found, fuzzy}]
+    similar_names: list[str] = field(default_factory=list)  # near-miss names for the no-data screen
+    call_cache: dict = field(default_factory=dict)  # identical tool calls are answered from here
+    cross_unavailable: str | None = None  # why no second independent source exists (model's reason)
+    refunds: int = 0  # failed / empty calls that did not use the call budget
+    cross_rejections: int = 0  # times a final answer was refused for lacking a cross-check
+    rank_rejections: int = 0  # times a cross-check of a ranking compared too few items
+    llm_calls: int = 0
+    llm_wait: float = 0.0  # seconds the model calls waited for rate limits
     findings: list[dict] = field(default_factory=list)  # raised confidence rules (rules.py)
     period: dict | None = None
     audited_files: set[str] = field(default_factory=set)
@@ -88,6 +106,11 @@ class QuestionCtx:
     budget_hit: bool = False
     unstructured: bool = False
     _seen: set = field(default_factory=set)
+
+    @property
+    def asks_for_ranking(self) -> bool:
+        """The question wants a rank / the top / the most: then who comes first must be verified."""
+        return bool(_RANKING.search(self.question))
 
     def flag(self, rule_id: str, where: dict | None = None, **detail) -> dict | None:
         """Raise a confidence rule once per (rule, place). Returns the finding if it is new."""
@@ -107,6 +130,28 @@ class QuestionCtx:
 
     def step(self, tool: str, detail: str, status: str = "ok") -> None:
         self.trace.append({"step": TOOL_LABELS.get(tool, tool), "detail": detail, "status": status})
+
+
+def axis_of(entry: dict) -> dict | None:
+    """Time axis of a catalog entry: its date range or its months (None for a snapshot table)."""
+    if entry.get("date_range"):
+        lo, _, hi = entry["date_range"].partition("~")
+        try:
+            return {"start": date.fromisoformat(lo), "end": date.fromisoformat(hi), "months": None}
+        except ValueError:
+            return None
+    if entry.get("month_values"):
+        return {"start": None, "end": None, "months": set(entry["month_values"])}
+    return None
+
+
+def axes_overlap(a: dict, b: dict) -> bool:
+    """Do two tables cover the same time? Summing them would count that time twice."""
+    if a["months"] is not None and b["months"] is not None:
+        return bool(a["months"] & b["months"])
+    if a["months"] is None and b["months"] is None:
+        return a["start"] <= b["end"] and b["start"] <= a["end"]
+    return False
 
 
 def fmt_won(v: float | None) -> str:
@@ -231,6 +276,31 @@ class ToolBox(AuditMixin):
                         self.ctx.defaults_applied.append(note)
                 continue
             m = glossary.match_term(t, cols, self.glossary_extra)
+            where_found = self._value_columns(t) if m["grade"] == "미등록" else []
+            if (
+                where_found
+            ):  # a name that exists in the data (거래처, 팀 ...): a value, not a column term
+                mappings.append(
+                    {
+                        "input": t,
+                        "grade": "값",
+                        "standard_term": None,
+                        "columns": where_found,
+                        "note": "데이터 안에 있는 값(이름)입니다. 컬럼이 아니라 filters 의 value 로 쓰세요.",
+                    }
+                )
+                continue
+            if m["grade"] == "미등록" and self._names_file_or_sheet(t):
+                mappings.append(
+                    {
+                        "input": t,
+                        "grade": "파일",
+                        "standard_term": None,
+                        "columns": [],
+                        "note": "파일·시트·부서 이름입니다. 컬럼이 아니라 search_catalog 의 dept 나 파일 선택에 쓰세요.",
+                    }
+                )
+                continue
             mappings.append(m | {"input": t})
             self.ctx.term_grades.add(m["grade"])
             if m["grade"] == "미등록" and t not in self.ctx.unregistered:
@@ -246,27 +316,116 @@ class ToolBox(AuditMixin):
         )
         return {"mappings": mappings, "period": period, "latest_data_year": latest}
 
+    def _names_file_or_sheet(self, text: str) -> bool:
+        t = text.strip()
+        if not t:
+            return False
+        if t in config.KNOWN_DEPARTMENTS:
+            return True
+        like = f"%{t}%"
+        return bool(
+            self.store.query(
+                "SELECT 1 FROM files WHERE name LIKE ? UNION ALL SELECT 1 FROM sheets WHERE sheet_name LIKE ? LIMIT 1",
+                [like, like],
+            )
+        )
+
+    def _value_columns(self, text: str) -> list[str]:
+        """Columns in which this exact text occurs as a value (empty if it is not data)."""
+        norm = normalize_value(text)
+        if not norm:
+            return []
+        rows = self.store.query(
+            "SELECT DISTINCT column_name FROM value_index WHERE value_norm = ? LIMIT 5", [norm]
+        )
+        return [r[0] for r in rows]
+
     # ------------------------------------------------------------------ 2. search_catalog
+    def pre_lookup(self, question: str) -> dict | None:
+        """What code can already tell from the question itself: glossary words, a period, and files it
+        names. Handed to the model with the question so it does not need extra round trips."""
+        words: list[str] = []
+        for g in [*self.glossary_extra, *glossary.GLOSSARY]:
+            for w in [g["term"], *g["synonyms"], *g["columns"]]:
+                if len(w) >= 2 and w in question and w not in words:
+                    words.append(w)
+        words = [w for w in words if not any(w != o and w in o for o in words)][:6]
+        periods = re.findall(
+            r"(?:\d{4}\s*년\s*)?(?:[1-4]\s*분기|상반기|하반기|\d{1,2}\s*월)|\d{4}\s*년", question
+        )
+        terms = [*words, *dict.fromkeys(periods[:2])]
+        files: list[str] = []
+        for tok in re.findall(r"[가-힣A-Za-z0-9_]{3,}", question):
+            for k in range(len(tok), 2, -1):  # "계약현황에서" -> "계약현황"
+                rows = self.store.query(
+                    "SELECT DISTINCT name FROM files WHERE fresh='ok' AND name LIKE ? LIMIT 3",
+                    [f"%{tok[:k]}%"],
+                )
+                if rows:
+                    files += [r[0] for r in rows if r[0] not in files]
+                    break
+        if not terms and not files:
+            return None
+        out: dict = {}
+        if terms:
+            res = self.lookup_terms(terms)
+            out = {"mappings": res["mappings"], "period": res["period"]}
+        if files:
+            out["mentioned_files"] = files[:5]
+            out["note"] = (
+                "질문에 파일 이름이 있으면 search_catalog 의 file 로 그 파일을 지정하세요."
+            )
+        return out
+
     def search_catalog(
-        self, columns: list[str], year: int | None = None, dept: str | None = None
+        self,
+        columns: list[str],
+        year: int | None = None,
+        dept: str | None = None,
+        file: str | None = None,
     ) -> dict:
         want = [c for c in (columns or []) if c]
         if not want:
             return {"error": "columns 를 지정하세요."}
+        # "공급가액|매출실적" means either column will do
+        alts = [[a.strip() for a in w.split("|") if a.strip()] for w in want]
+        year = year or (self.ctx.period or {}).get("year")  # a question about 2026 wants 2026 files
         rows = self.store.query(
             "SELECT s.table_name, f.rel_path, f.name, f.dept, f.modified, f.fresh, f.copy_of, f.data_date,"
             " s.sheet_name, s.n_data_rows, s.preamble FROM sheets s JOIN files f ON f.file_id=s.file_id"
             " WHERE s.table_name IS NOT NULL AND f.status IN ('ok','partial') ORDER BY f.rel_path, s.sheet_index"
         )
-        cands, excluded = [], []
+        cands, excluded, near = [], [], []
+        layouts: dict[tuple, list[dict]] = {}
         for t, path, name, d, modified, fresh, copy_of, data_date, sheet, n, pre in rows:
             if dept and d != dept:
+                continue
+            if file and file.strip() not in path:  # the question named a file (e.g. 계약현황)
                 continue
             cols = {
                 c[0]: c[1]
                 for c in self.store.query("SELECT name, dtype FROM columns WHERE table_name=?", [t])
             }
-            if not all(any(w == c or w in c for c in cols) for w in want):
+            matched = [
+                w
+                for w, alt in zip(want, alts, strict=True)
+                if any(a == c or a in c for a in alt for c in cols)
+            ]
+            if len(matched) < len(want):
+                if (matched or file) and fresh == "ok":  # a named file: always show its columns
+                    near.append(
+                        {
+                            "n": len(matched),
+                            "table": t,
+                            "file": name,
+                            "sheet": sheet,
+                            "dept": d,
+                            "has": matched,
+                            "missing": [w for w in want if w not in matched],
+                            "data_date": data_date,
+                            "columns": list(cols),
+                        }
+                    )
                 continue
             preamble = json.loads(pre or "[]")
             title = preamble[0] if preamble else ""
@@ -286,6 +445,20 @@ class ToolBox(AuditMixin):
                     }
                 )
                 continue
+            info = self.store.file_info.get(path, {})
+            if info.get("tie_with"):  # same numbers in another layout (e.g. unit 천원): keep one
+                group = [path, *info["tie_with"]]
+                primary = min(group, key=lambda p: (len(p.rsplit("/", 1)[-1]), p))
+                if path != primary and self._same_data(path, info["tie_with"][0])[0]:
+                    excluded.append(
+                        {
+                            "file": name,
+                            "path": path,
+                            "reason": f"서식만 다른 사본(같은 자료, 기준은 {primary.rsplit('/', 1)[-1]})",
+                            "data_date": data_date,
+                        }
+                    )
+                    continue
             entry = {
                 "table": t,
                 "file": name,
@@ -298,6 +471,9 @@ class ToolBox(AuditMixin):
                 "unit": next((p for p in preamble if "단위" in p), None),
                 "rows": n,
                 "columns": list(cols),
+                "excerpt": bool(
+                    EXCERPT.search(title)
+                ),  # an excerpt copies another file: not independent
             }
             dcols = [c for c, ty in cols.items() if ty == "DATE"]
             if dcols:
@@ -312,25 +488,87 @@ class ToolBox(AuditMixin):
                 ]
                 entry["month_values"] = sorted(months, key=lambda x: int(re.sub(r"\D", "", x) or 0))
             cands.append(entry)
-        # newest data first, so the current base file is the first candidate
+            layouts.setdefault(tuple(cols), []).append(
+                {
+                    "table": t,
+                    "file": name,
+                    "sheet": sheet,
+                    "data_date": data_date,
+                    "_axis": axis_of(entry),
+                }
+            )
+        # newest data first, so the current base file is the first candidate; excerpts go last
         cands.sort(key=lambda c: c["data_date"] or c["modified"], reverse=True)
+        cands.sort(key=lambda c: c["excerpt"])
         cands = cands[:12]
+        for c in cands:
+            # Tables with the very same columns may be summed with also_tables - but only sheets of the
+            # same workbook (e.g. warehouses) or files for DIFFERENT periods (monthly files). Anything
+            # covering the same time (excerpts, other versions, other snapshot dates) would be counted twice.
+            mine = axis_of(c)
+            same = [
+                x
+                for x in layouts.get(tuple(c["columns"]), [])
+                if x["table"] != c["table"]
+                and (
+                    x["file"] == c["file"]
+                    or (mine and x["_axis"] and not axes_overlap(mine, x["_axis"]))
+                )
+            ]
+            same.sort(key=lambda x: x["data_date"] or "", reverse=True)  # newest files first
+            same.sort(
+                key=lambda x: x["file"] != c["file"]
+            )  # sheets of the same workbook come first
+            if same:
+                c["same_layout_tables"] = [
+                    {k: v for k, v in x.items() if not k.startswith("_")} for x in same[:40]
+                ]
         self.ctx.catalog_searches.append({"columns": want, "found": len(cands)})
         self.ctx.step(
             "search_catalog",
             f"후보 {len(cands)}개, 제외 {len(excluded)}개",
             "ok" if cands else "warn",
         )
-        return {
+        out = {
             "candidates": cands,
             "excluded": excluded[:10],
-            "note": "excluded 는 구버전·사본이라 기준으로 쓰지 않음",
+            "note": "excluded 는 구버전·사본이라 기준으로 쓰지 않음. same_layout_tables 가 있으면 run_query 의 "
+            "also_tables 로 합쳐서 집계할 수 있음(예: 창고별 시트, 월별 파일).",
         }
+        if not cands:  # help the model find the right column names instead of guessing again
+            near.sort(key=lambda x: (-x["n"], x["data_date"] or ""), reverse=False)
+            near.sort(key=lambda x: -x["n"])
+            out["hint"] = (
+                "요청한 컬럼을 모두 가진 표가 없습니다. 아래 가장 가까운 표(closest_tables)와 실제 컬럼명"
+                "(known_columns)을 보고 컬럼을 바꿔 다시 검색하세요. 두 가지 컬럼 중 하나면 되면 'A|B'로 쓰세요."
+            )
+            out["closest_tables"] = [
+                {k: x[k] for k in ("table", "file", "sheet", "dept", "has", "missing", "columns")}
+                for x in near[:5]
+            ]
+            out["known_columns"] = [
+                r[0]
+                for r in self.store.query(
+                    "SELECT c.name FROM columns c JOIN sheets s ON s.table_name=c.table_name"
+                    " JOIN files f ON f.file_id=s.file_id WHERE f.fresh='ok'"
+                    " GROUP BY c.name ORDER BY count(*) DESC LIMIT 50"
+                )
+            ]
+        return out
 
     # ------------------------------------------------------------------ 3. search_value
     def search_value(self, text: str, exact: bool = False) -> dict:
         self.ctx.searched = True
         hits = self.store.search_value(text, exact=exact, limit=300)
+        # a shorter text searched after the full name found nothing is a guess ("전자" for "가나다전자"):
+        # its hits are similar names, not evidence for the thing that was asked about
+        norm = normalize_value(text)
+        fuzzy = any(
+            v["found"] == 0
+            and norm != normalize_value(v["text"])
+            and norm in normalize_value(v["text"])
+            for v in self.ctx.value_searches
+        )
         groups: dict[tuple, dict] = {}
         for h in hits:
             meta = self.table_meta(h["table"])
@@ -354,19 +592,32 @@ class ToolBox(AuditMixin):
             if len(g["first_rows"]) < 3:
                 g["first_rows"].append(h["row"])
         out = sorted(groups.values(), key=lambda g: (g["fresh"] != "ok", -g["hits"]))[:15]
-        for g in out:  # local-only snippet for the UI (never sent to the LLM)
-            self.file_audit(self.table_meta(g["_table"]))
-            self.ctx.search_hits.append(
-                {**g, "snippet": self._snippet(g["_table"], g["first_rows"][0]), "exact": exact}
-            )
-        self.ctx.value_searches.append({"text": text, "found": len(out)})
+        if fuzzy:
+            for h in hits:
+                if h["value"] not in self.ctx.similar_names and len(self.ctx.similar_names) < 8:
+                    self.ctx.similar_names.append(h["value"])
+        else:
+            for g in out:  # local-only snippet for the UI (never sent to the LLM)
+                self.file_audit(self.table_meta(g["_table"]), check_period=False)
+                self.ctx.search_hits.append(
+                    {**g, "snippet": self._snippet(g["_table"], g["first_rows"][0]), "exact": exact}
+                )
+        self.ctx.value_searches.append({"text": text, "found": len(out), "fuzzy": fuzzy})
         self.ctx.step(
             "search_value", f"'{text}' 위치 {len(out)}곳 ({len(hits)}건)", "ok" if out else "warn"
         )
-        return {
+        res = {
             "locations": [{k: v for k, v in g.items() if not k.startswith("_")} for g in out],
             "total_hits": len(hits),
         }
+        if fuzzy:
+            res["fuzzy"] = True
+            res["similar_values"] = list(dict.fromkeys(h["value"] for h in hits))[:8]
+            res["note"] = (
+                "앞서 찾은 이름이 없어 일부만 일치시킨 결과입니다. 같은 대상이라고 단정하지 말고, "
+                "원래 이름은 없고 비슷한 이름만 있다고 답하세요."
+            )
+        return res
 
     def _snippet(self, table: str, row_no: int) -> str:
         cols = list(self.table_meta(table)["columns"])
@@ -402,6 +653,19 @@ class ToolBox(AuditMixin):
             if op not in OPS:
                 raise ValueError(f"지원하지 않는 연산자: {op}")
             q, ty = quote_ident(col), meta["columns"][col]
+            if other := f.get("value_column"):  # compare with another column of the same row
+                if other not in meta["columns"]:
+                    raise ValueError(
+                        f"컬럼이 없습니다: {other} (가능: {', '.join(meta['columns'])})"
+                    )
+                if op not in ("=", "!=", ">", ">=", "<", "<="):
+                    raise ValueError("열끼리 비교는 =, !=, >, >=, <, <= 만 쓸 수 있습니다.")
+                if meta["columns"][other] != ty:
+                    raise ValueError(
+                        f"'{col}'({ty})와 '{other}'({meta['columns'][other]})는 형식이 달라 비교할 수 없습니다."
+                    )
+                parts.append(f"{q} {op} {quote_ident(other)}")
+                continue
             if op == "in":
                 items = [self._coerce(ty, x) for x in val.split(",") if x.strip()]
                 parts.append(f"{q} IN ({','.join('?' * len(items))})")
@@ -425,14 +689,17 @@ class ToolBox(AuditMixin):
         group_by: list[str] | None = None,
         filters: list[dict] | None = None,
         order_desc: bool = True,
-        limit: int = 20,
+        limit: int | None = None,
+        also_tables: list[str] | None = None,
     ) -> dict:
         if self.ctx.failures.get("run_query", 0) > config.MAX_QUERY_RETRIES:
             return {
                 "error": f"쿼리 재시도 한도({config.MAX_QUERY_RETRIES}회)를 넘었습니다. 지금까지 얻은 근거로 답하세요."
             }
         try:
-            res = self._run_query(table, metrics, group_by or [], filters or [], order_desc, limit)
+            res = self._run_query(
+                table, metrics, group_by or [], filters or [], order_desc, limit, also_tables or []
+            )
         except Exception as exc:  # validation or SQL errors -> the LLM may fix the spec and retry
             n = self.ctx.failures["run_query"] = self.ctx.failures.get("run_query", 0) + 1
             if n > config.MAX_QUERY_RETRIES:
@@ -446,8 +713,12 @@ class ToolBox(AuditMixin):
             self.ctx.anomalies["retry_ok"] = True
         return res
 
-    def _run_query(self, table, metrics, group_by, filters, order_desc, limit) -> dict:
-        meta = self.table_meta(table)
+    def _run_query(self, table, metrics, group_by, filters, order_desc, limit, also_tables) -> dict:
+        tables = list(dict.fromkeys([table, *also_tables]))
+        if len(tables) > MAX_UNION_TABLES:
+            raise ValueError(f"한 번에 합칠 수 있는 표는 {MAX_UNION_TABLES}개까지입니다.")
+        metas = [self.table_meta(t) for t in tables]
+        meta = metas[0]
         cols = meta["columns"]
         if not metrics:
             raise ValueError("metrics 가 비었습니다.")
@@ -463,12 +734,7 @@ class ToolBox(AuditMixin):
                 raise ValueError(f"지원하지 않는 집계: {agg} (가능: {', '.join(AGGS)})")
             if agg != "count" and col not in cols:
                 raise ValueError(f"컬럼이 없습니다: {col} (가능: {', '.join(cols)})")
-            if agg in ("sum", "avg") and cols.get(col) not in (
-                "BIGINT",
-                "INTEGER",
-                "DOUBLE",
-                "DECIMAL",
-            ):
+            if agg in ("sum", "avg") and cols.get(col) not in NUMERIC_TYPES:
                 raise ValueError(f"'{col}' 은 숫자 컬럼이 아니라 {agg} 를 쓸 수 없습니다.")
             q = quote_ident(col) if col else "*"
             expr = f"COUNT(DISTINCT {q})" if agg == "count_distinct" else f"{AGGS[agg]}({q})"
@@ -482,35 +748,78 @@ class ToolBox(AuditMixin):
                     "money": money,
                 }
             )
-        where, params = self._where(meta, filters)
+        used = list(dict.fromkeys([*group_by, *(s["column"] for s in specs if s["column"])]))
+        # one (where, params, rows) per table
+        parts = []
+        for mt in metas:
+            for c in used:
+                if c not in mt["columns"]:
+                    raise ValueError(
+                        f"합치려는 표 {mt['table']}({mt['file']} [{mt['sheet']}])에 '{c}' 컬럼이 없습니다. "
+                        "같은 컬럼 구조의 표끼리만 합칠 수 있습니다."
+                    )
+            where_i, params_i = self._where(mt, filters)
+            rows_i = [
+                r[0]
+                for r in self.store.query(
+                    f"SELECT _row FROM {mt['table']} WHERE {where_i} ORDER BY _row LIMIT 20000",
+                    params_i,
+                )
+            ]
+            parts.append((mt, where_i, params_i, rows_i))
+        ranges = [self._effective_range(mt, filters) for mt in metas]
+        stock_metric = any(c in STOCK_COLUMNS for c in (s["column"] for s in specs))
+        for i in range(len(metas)):
+            for j in range(i + 1, len(metas)):
+                a, b = ranges[i], ranges[j]
+                label = f"{metas[i]['file']} [{metas[i]['sheet']}] 와 {metas[j]['file']} [{metas[j]['sheet']}]"
+                if a and b and axes_overlap(a, b):
+                    raise ValueError(
+                        f"기간이 겹치는 표를 합치면 같은 거래가 두 번 더해집니다: {label}"
+                    )
+                if (a is None or b is None) and metas[i]["path"] != metas[j]["path"]:
+                    # no time axis: fine for flow numbers of different files (monthly ledgers),
+                    # never for stock numbers (inventory, balances) or for files of the same date
+                    if stock_metric or metas[i]["data_date"] == metas[j]["data_date"]:
+                        raise ValueError(
+                            f"서로 다른 파일의 현황표(재고·잔액 등)를 합치면 이중 집계됩니다: {label}. "
+                            "같은 통합문서의 시트끼리만 합칠 수 있습니다."
+                        )
+        mult = meta["unit_mult"]
+        if len(tables) == 1:
+            from_sql, where, params = table, parts[0][1], parts[0][2]
+        else:  # same-layout sheets / files summed together; money columns are put on one unit first
+            branches, params = [], []
+            money_cols = {s["column"] for s in specs if s["money"] and s["column"]}
+            for mt, where_i, params_i, _ in parts:
+                sel_cols = [
+                    f"{quote_ident(c)} * {mt['unit_mult']} AS {quote_ident(c)}"
+                    if c in money_cols and mt["columns"][c] in NUMERIC_TYPES
+                    else quote_ident(c)
+                    for c in used
+                ] or ["1 AS _one"]
+                branches.append(f"SELECT {', '.join(sel_cols)} FROM {mt['table']} WHERE {where_i}")
+                params += params_i
+            from_sql, where, mult = "(" + " UNION ALL ".join(branches) + ") u", "TRUE", 1
         sel = ", ".join([*(quote_ident(g) for g in group_by), *selects])
         grp = f" GROUP BY {', '.join(str(i + 1) for i in range(len(group_by)))}" if group_by else ""
         order_col = len(group_by) + 1
         order = f" ORDER BY {order_col} {'DESC' if order_desc else 'ASC'}" if group_by else ""
         n_limit = max(1, min(int(limit or 20), config.MAX_GROUP_ROWS))
         total_groups = self.store.query(
-            f"SELECT count(*) FROM (SELECT 1 FROM {table} WHERE {where}{' GROUP BY ' + ', '.join(quote_ident(g) for g in group_by) if group_by else ''})",
+            f"SELECT count(*) FROM (SELECT 1 FROM {from_sql} WHERE {where}"
+            f"{' GROUP BY ' + ', '.join(quote_ident(g) for g in group_by) if group_by else ''})",
             params,
         )[0][0]
-        if total_groups > config.MAX_GROUP_ROWS and group_by:
+        if total_groups > config.MAX_GROUP_ROWS and group_by and not limit:
             raise ValueError(
-                f"결과가 {total_groups}개 그룹이라 너무 많습니다. 필터를 더 걸거나 다른 컬럼으로 묶으세요."
+                f"결과가 {total_groups}개 그룹이라 너무 많습니다. 상위 N개만 보려면 limit(최대 "
+                f"{config.MAX_GROUP_ROWS})를 지정하고, 아니면 필터를 더 걸거나 다른 컬럼으로 묶으세요."
             )
         raw = self.store.query(
-            f"SELECT {sel}{(' FROM ' + table)} WHERE {where}{grp}{order} LIMIT {n_limit}", params
+            f"SELECT {sel} FROM {from_sql} WHERE {where}{grp}{order} LIMIT {n_limit}", params
         )
-        rows_used = [
-            r[0]
-            for r in self.store.query(
-                f"SELECT _row FROM {table} WHERE {where} ORDER BY _row LIMIT 20000", params
-            )
-        ]
-        src = (
-            rows_used[0] if rows_used else None,
-            rows_used[-1] if rows_used else None,
-            len(rows_used),
-        )
-        mult = meta["unit_mult"]
+        n_rows = sum(len(p[3]) for p in parts)
         out_rows = []
         for r in raw:
             row = dict(zip(group_by, r[: len(group_by)], strict=True))
@@ -528,19 +837,20 @@ class ToolBox(AuditMixin):
             for i, row in enumerate(out_rows, 1):
                 row["rank"] = i if order_desc else None
         qid = f"q{len(self.ctx.queries) + 1}"
-        if not out_rows or src[2] == 0:
+        if not out_rows or n_rows == 0:
             self.ctx.anomalies["empty"] = True
         before = len(self.ctx.findings)
-        self.file_audit(meta)
-        used = [*group_by, *(s["column"] for s in specs if s["column"])]
-        self.row_audit(
-            meta,
-            where,
-            params,
-            list(dict.fromkeys(used)),
-            [s["column"] for s in specs if s["agg"] == "sum" and s["column"]],
-            rows_used,
-        )
+        sums = [s["column"] for s in specs if s["agg"] == "sum" and s["column"]]
+        for mt, where_i, params_i, rows_i in parts:
+            self.file_audit(mt)
+            self.row_audit(mt, where_i, params_i, used, sums, rows_i)
+        eff = self._merge_ranges(ranges)
+        if eff and not eff["filtered"] and self.ctx.period is None and eff["span_days"] > 40:
+            self.ctx.flag(
+                "M4",
+                self.where_dict(meta),
+                span=eff["text"],
+            )
         raised = [f["title"] for f in self.ctx.findings[before:] if f["severity"] != rules.INFO]
         res = {
             "query_id": qid,
@@ -550,38 +860,180 @@ class ToolBox(AuditMixin):
             "file_status": meta["fresh"],
             "data_date": meta["data_date"],
             "unit": next((p for p in meta["preamble"] if "단위" in p), None),
-            "rows_used": src[2],
+            "rows_used": n_rows,
             "group_by": group_by,
             "metrics": [s["label"] for s in specs],
             "result": out_rows,
             # what the rules found in this data (the LLM may mention them; code shows them anyway)
             "data_warnings": raised[:6],
         }
+        if group_by and total_groups > len(out_rows):
+            res["groups_total"] = total_groups  # only the top rows are returned (limit)
+            res["truncated"] = True
+        if eff:
+            res["period_covered"] = eff["text"]  # the real range these numbers come from
+        if len(tables) > 1:
+            res["tables_combined"] = [f"{m['file']} [{m['sheet']}]" for m in metas]
         self.ctx.queries[qid] = res | {
             "_group_by": group_by,
             "_metric": specs[0]["label"],
+            "_metric_column": specs[0]["column"],
             "_money": specs[0]["money"],
             "_path": meta["path"],
             "_data_date": meta["data_date"],
             "_title": self._title(meta),
             "_family": catalog.family_stem(meta["file"]),
             "_dept": meta["dept"],
+            "_range": eff,
         }
-        self.ctx.sources.append(
-            self._source(
-                meta,
-                rows_used,
-                [*group_by, *(s["column"] for s in specs if s["column"])],
-                qid,
-                "계산 근거",
-            )
+        for mt, _w, _p, rows_i in parts:
+            if rows_i or len(tables) == 1:
+                self.ctx.sources.append(self._source(mt, rows_i, used, qid, "계산 근거"))
+        label = (
+            f"{meta['file']} [{meta['sheet']}]"
+            if len(tables) == 1
+            else f"{len(tables)}개 표 합산({meta['file']} 외)"
         )
         self.ctx.step(
             "run_query",
-            f"{meta['file']} [{meta['sheet']}] {src[2]}행 사용 → {len(out_rows)}개 결과",
+            f"{label} {n_rows}행 사용 → {len(out_rows)}개 결과"
+            + (f" · 조회 기간 {eff['text']}" if eff else ""),
             "warn" if self.ctx.anomalies.get("empty") else "ok",
         )
         return res
+
+    # ---- which dates / months the numbers of a query really cover
+    def _effective_range(self, meta: dict, filters: list[dict]) -> dict | None:
+        """Date range (or months) a query used: the filters on the table's date / 월 column, and the
+        table's own range for the side that is not filtered. None if the table has no time axis."""
+        cols = meta["columns"]
+        t = meta["table"]
+        dcols = [c for c, ty in cols.items() if ty == "DATE"]
+        fcols = {f.get("column") for f in filters}
+        if dcols:
+            dcol = next((c for c in dcols if c in fcols), dcols[0])
+            lo, hi = self.store.query(
+                f"SELECT min({quote_ident(dcol)}), max({quote_ident(dcol)}) FROM {t} WHERE _row_kind='data'"
+            )[0]
+            if lo is None or hi is None:
+                return None
+            start, end, filtered = lo, hi, dcol in fcols
+            for f in filters:
+                if f.get("column") != dcol:
+                    continue
+                op, val = f.get("op", "="), str(f.get("value", ""))
+                try:
+                    if op == "between":
+                        a, b = (date.fromisoformat(x.strip()) for x in val.split(",", 1))
+                        start, end = max(start, a), min(end, b)
+                    elif op in (">=", ">"):
+                        start = max(start, date.fromisoformat(val.strip()))
+                    elif op in ("<=", "<"):
+                        end = min(end, date.fromisoformat(val.strip()))
+                    elif op == "=":
+                        start = end = date.fromisoformat(val.strip())
+                except ValueError:
+                    continue
+            return {
+                "start": start,
+                "end": end,
+                "months": None,
+                "filtered": filtered,
+                "span_days": (end - start).days,
+                "text": f"{start}~{end}",
+            }
+        if "월" in cols:
+            present = {
+                r[0]
+                for r in self.store.query(
+                    f"SELECT DISTINCT {quote_ident('월')} FROM {t} WHERE _row_kind='data'"
+                )
+            }
+            months, filtered = set(present), "월" in fcols
+            for f in filters:
+                if f.get("column") == "월" and f.get("op") in ("in", "="):
+                    months &= {x.strip() for x in str(f.get("value", "")).split(",")}
+            if not months or not all(re.fullmatch(r"\d{1,2}월", str(m)) for m in months):
+                return None
+            order = sorted(months, key=lambda x: int(re.sub(r"\D", "", x)))
+            return {
+                "start": None,
+                "end": None,
+                "months": set(months),
+                "filtered": filtered,
+                "span_days": 31 * (len(months) - 1) + 1,
+                "text": order[0] if len(order) == 1 else f"{order[0]}~{order[-1]}",
+            }
+        return None
+
+    @staticmethod
+    def _merge_ranges(ranges: list[dict | None]) -> dict | None:
+        ranges = [r for r in ranges if r]
+        if not ranges:
+            return None
+        if all(r["months"] is not None for r in ranges):
+            months = set().union(*(r["months"] for r in ranges))
+            order = sorted(months, key=lambda x: int(re.sub(r"\D", "", x)))
+            return {
+                "start": None,
+                "end": None,
+                "months": months,
+                "filtered": all(r["filtered"] for r in ranges),
+                "span_days": 31 * (len(months) - 1) + 1,
+                "text": order[0] if len(order) == 1 else f"{order[0]}~{order[-1]}",
+            }
+        dated = [r for r in ranges if r["months"] is None]
+        start, end = min(r["start"] for r in dated), max(r["end"] for r in dated)
+        return {
+            "start": start,
+            "end": end,
+            "months": None,
+            "filtered": all(r["filtered"] for r in dated),
+            "span_days": (end - start).days,
+            "text": f"{start}~{end}",
+        }
+
+    def check_period_claim(self, texts: list[str]) -> None:
+        """The answer says '3분기' but the numbers it quotes come from Jan-Sep? Compare the period
+        named in the answer with the range of the queries whose figures the answer quotes."""
+        text = " ".join(t for t in texts if t)
+        cleaned = _DAY_DATE.sub(" ", text)  # '9월 30일', '2026-09-28' are days, not periods
+        labels = {f"{n}분기" for n in re.findall(r"([1-4])\s*분기", cleaned)}
+        labels |= {f"{n}월" for n in re.findall(r"(?<!\d)(1[0-2]|[1-9])\s*월", cleaned)}
+        labels |= set(re.findall(r"상반기|하반기", cleaned))
+        if len(labels) != 1:
+            return  # no period named, or several: cannot tell which one the numbers belong to
+        claimed = glossary.parse_period(cleaned, self.latest_year())
+        if not claimed:
+            return
+        figures = {re.sub(r"\s+", "", m.group(0)) for m in _FIGURE.finditer(text)}
+        if not figures:
+            return
+        cs, ce = date.fromisoformat(claimed["start"]), date.fromisoformat(claimed["end"])
+        for q in self.ctx.queries.values():
+            eff = q.get("_range")
+            if not eff:
+                continue
+            shown = {
+                str(v).replace(" ", "")
+                for row in q["result"]
+                for k, v in row.items()
+                if k.endswith("_display")
+            }
+            if not (figures & shown):
+                continue
+            ok = (
+                eff["months"] <= set(claimed["months"])
+                if eff["months"] is not None
+                else cs <= eff["start"] and eff["end"] <= ce
+            )
+            if not ok:
+                self.ctx.flag(
+                    "P3",
+                    {"file": q["file"], "path": q["_path"], "sheet": q["sheet"]},
+                    claimed=claimed["text"],
+                    actual=eff["text"],
+                )
 
     def _source(
         self, meta: dict, rows: list[int], cols: list[str], qid: str | None, role: str
@@ -616,6 +1068,19 @@ class ToolBox(AuditMixin):
             return {
                 "error": "같은 표를 다시 계산하는 것은 교차검증이 아닙니다. 다른 파일(다른 표)로 같은 지표를 계산하세요."
             }
+        if a["_range"] is None and b["_range"] is None and a["_data_date"] != b["_data_date"]:
+            return {
+                "error": f"기준일이 다른 현황표({a['_data_date']} 대 {b['_data_date']})는 같은 시점의 값이 아니라 "
+                "교차검증이 아닙니다. 독립된 두 번째 자료가 없으면 final_answer 의 no_cross_reason 에 이유를 적으세요."
+            }
+        ta, tb = (glossary.standard_terms_of(q.get("_metric_column")) for q in (a, b))
+        related = bool(ta and tb and not (ta & tb) and any(p <= (ta | tb) for p in RELATED_METRICS))
+        if ta and tb and not (ta & tb) and not related:
+            return {
+                "error": f"서로 다른 지표라 교차검증이 아닙니다: {a['_metric_column']}({'/'.join(ta)}) 대 "
+                f"{b['_metric_column']}({'/'.join(tb)}). 같은 지표를 계산하는 다른 파일"
+                "(예: 집계 파일의 매출실적 대 매출원장의 공급가액)로 비교하세요."
+            }
         if a["_family"] == b["_family"] and a["_dept"] == b["_dept"]:
             return {
                 "error": "같은 계열의 파일(버전·사본·서식만 다른 파일)끼리의 비교는 독립된 교차검증이 아닙니다. "
@@ -639,6 +1104,17 @@ class ToolBox(AuditMixin):
             return {
                 "error": "두 결과에 겹치는 항목이 없어 비교할 수 없습니다. group_by 를 맞추세요."
             }
+        if self.ctx.asks_for_ranking and len(common) < MIN_RANK_ITEMS:
+            self.ctx.rank_rejections += 1
+            if (
+                self.ctx.rank_rejections <= 2
+            ):  # the model gets two chances to compare the whole ranking
+                return {
+                    "error": f"순위를 묻는 질문인데 겹치는 항목이 {len(common)}개뿐이라 순위를 검증할 수 없습니다. "
+                    "한 항목만 필터링해 비교하지 말고, 두 자료를 같은 group_by 로 전체(또는 limit 5 이상 상위 항목)를 "
+                    "집계해 다시 cross_verify 하세요."
+                }
+            self.ctx.flag("X12", {"file": f"{a['file']} ↔ {b['file']}"}, n=len(common))
         money = a["_money"] and b["_money"]
         rank_a = {k: i for i, k in enumerate(sorted(common, key=lambda k: -(ka[k] or 0)), 1)}
         rank_b = {k: i for i, k in enumerate(sorted(common, key=lambda k: -(kb[k] or 0)), 1)}
@@ -672,6 +1148,13 @@ class ToolBox(AuditMixin):
                 if any(abs(r / 10**k_pow - 1) < 0.05 for r in (ratio, 1 / ratio)):
                     unit_suspect = 10**k_pow
         dates = {a["_data_date"], b["_data_date"]}
+        if related:
+            self.ctx.flag(
+                "X11",
+                {"file": f"{a['file']} ↔ {b['file']}"},
+                a=a["_metric_column"],
+                b=b["_metric_column"],
+            )
         self.ctx.cross = {
             "match": match,
             "rank_changed": rank_changed,

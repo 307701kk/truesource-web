@@ -38,7 +38,10 @@ def _legacy_findings(ctx) -> list[dict]:
     # ② cross-check
     c = ctx.cross
     if c is None:
-        out.append(mk("X1" if ctx.queries else "X9"))
+        if ctx.queries and ctx.cross_unavailable:
+            out.append(mk("X10", reason=ctx.cross_unavailable))
+        else:
+            out.append(mk("X1" if ctx.queries else "X9"))
     else:
         rel = c.get("max_rel", 0.0)
         shown = f"{rel * 100:.1f}%"

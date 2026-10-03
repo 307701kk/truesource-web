@@ -272,7 +272,10 @@ def test_q3_scenario_end_to_end(service):
     assert out["number_check"] == "ok"
     names = [r["rank_team"] for r in out["comparison_table"]]
     assert set(names) == {"해외영업팀", "영업2팀"}  # placeholders were restored locally
-    assert [s["step"] for s in out["trace"]][:3] == ["용어 조회", "카탈로그 검색", "카탈로그 검색"]
+    steps = [s["step"] for s in out["trace"]]
+    assert (
+        steps[0] == "용어 조회" and steps.count("카탈로그 검색") == 2
+    )  # code looks the terms up first
     assert any(s["step"] == "차이 추적" for s in out["trace"])
     assert {s["file"] for s in out["sources"]} >= {"실적집계_v2.xlsx", "매출원장_2026.xlsx"}
     assert all(s["indexed"] for s in out["sources"])

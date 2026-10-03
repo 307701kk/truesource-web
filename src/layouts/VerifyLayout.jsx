@@ -10,7 +10,7 @@ export default function VerifyLayout({ data }) {
     <>
       <VerdictBanner claim={data.claim} />
       <AnswerCard answer={data.answer} />
-      <ClaimTable checks={data.claim.checks} />
+      <ClaimTable checks={data.claim?.checks ?? []} />
       {data.cause && <CauseCard cause={data.cause} />}
       {data.sources && <SourcesTable sources={data.sources} />}
     </>
