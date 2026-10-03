@@ -8,6 +8,7 @@ import AuditView from './components/AuditView'
 import HistoryView from './components/HistoryView'
 import { OpenFileProvider } from './components/OpenFile'
 import Loading3D from './components/Loading3D'
+import ErrorBoundary from './components/ErrorBoundary'
 import GlossaryView from './components/GlossaryView'
 import { getCatalog, getLlmCheck, login } from './api/backend'
 
@@ -139,7 +140,11 @@ export default function App() {
           {!loading && !error && !result && (
             <div className="state">질문을 입력하거나 아래 예시를 눌러보세요.</div>
           )}
-          {!loading && !error && result && <ResultView data={result} onAsk={handleAsk} />}
+          {!loading && !error && result && (
+            <ErrorBoundary key={result.question_id} data={result}>
+              <ResultView data={result} onAsk={handleAsk} />
+            </ErrorBoundary>
+          )}
         </div>
         </>)}
       </main>

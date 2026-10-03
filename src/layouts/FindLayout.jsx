@@ -6,7 +6,7 @@ export default function FindLayout({ data }) {
   return (
     <>
       <AnswerCard answer={data.answer} />
-      <SearchResultList results={data.search_results} />
+      {data.search_results?.length > 0 && <SearchResultList results={data.search_results} />}
     </>
   )
 }

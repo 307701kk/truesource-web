@@ -642,3 +642,21 @@ def test_question_type_follows_the_llm_not_a_stray_claim(tmp_path):
     assert verify["type"] == "검증형" and verify["claim"]["verdict"] == "맞음"
     missing = Agent(svc, ScriptedGateway(_typed("검증형", None))).ask("검증", user)
     assert missing["type"] == "질문형"  # no claim table -> cannot render a verification
+
+
+def test_search_type_without_any_hit_falls_back_to_a_question(tmp_path):
+    """The screen for 찾기형 needs search results; an answer typed 찾기형 without hits must not claim it."""
+    from app.agent.runner import Agent
+    from tests.test_agent import ScriptedGateway
+
+    root = tmp_path / "s"
+    make(root, "영업팀/실적.xlsx", {"팀별실적": perf(month_rows())})
+    svc = scan(root)
+
+    def policy(step, r, contents):
+        if step == 0:
+            return [("lookup_terms", {"terms": ["실적"]})]
+        return [("final_answer", {"question_type": "찾기형", "answer": "없습니다."})]
+
+    out = Agent(svc, ScriptedGateway(policy)).ask("자료 찾아줘", {"name": "홍", "company": "c"})
+    assert out["type"] != "찾기형" and out["search_results"] is None
