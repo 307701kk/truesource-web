@@ -7,6 +7,7 @@ import SetupScreen from './components/SetupScreen'
 import AuditView from './components/AuditView'
 import HistoryView from './components/HistoryView'
 import { OpenFileProvider } from './components/OpenFile'
+import Loading3D from './components/Loading3D'
 import GlossaryView from './components/GlossaryView'
 import { getCatalog, getLlmCheck, login } from './api/backend'
 
@@ -133,7 +134,7 @@ export default function App() {
         {view === 'ask' && (<>
         <QuestionBar onAsk={handleAsk} loading={loading} />
         <div className="content">
-          {loading && <div className="state">답변을 찾는 중…</div>}
+          {loading && <Loading3D />}
           {error && <div className="state error">오류: {error}</div>}
           {!loading && !error && !result && (
             <div className="state">질문을 입력하거나 아래 예시를 눌러보세요.</div>
