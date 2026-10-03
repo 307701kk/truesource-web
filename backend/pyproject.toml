@@ -14,3 +14,4 @@ filterwarnings = ["ignore:Using .httpx. with .starlette.testclient"]
 "app/agent/*.py" = ["E501"]
 "app/companydb.py" = ["E501"]  # long SQL strings
 "tests/test_agent.py" = ["E501"]
+"tests/test_rules.py" = ["E501"]

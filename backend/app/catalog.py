@@ -158,9 +158,24 @@ def assign_freshness(files: list[FileFacts]) -> dict[str, dict]:
 
     for members in families.values():
         newest = max(dates[m.rel_path] for m in members)
+        top = sorted((m for m in members if dates[m.rel_path] == newest), key=lambda m: m.rel_path)
         for m in members:
             fresh = FRESH_OK if dates[m.rel_path] == newest else FRESH_STALE
-            result[m.rel_path] = {"fresh": fresh, "copy_of": None, "data_date": dates[m.rel_path]}
+            # the other newest files of the family whose content differs: "which one is right?"
+            tie = [t.rel_path for t in top if t.rel_path != m.rel_path and t.sha256 != m.sha256]
+            result[m.rel_path] = {
+                "fresh": fresh,
+                "copy_of": None,
+                "data_date": dates[m.rel_path],
+                "newer": top[0].rel_path if fresh == FRESH_STALE else None,
+                "tie_with": tie if fresh == FRESH_OK else [],
+            }
     for rel, original in copies.items():
-        result[rel] = {"fresh": FRESH_COPY, "copy_of": original, "data_date": dates[rel]}
+        result[rel] = {
+            "fresh": FRESH_COPY,
+            "copy_of": original,
+            "data_date": dates[rel],
+            "newer": None,
+            "tie_with": [],
+        }
     return result

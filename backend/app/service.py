@@ -187,6 +187,7 @@ class ScanService:
         store = Store()
         facts: list[catalog.FileFacts] = []
         total_sheets = total_rows = 0
+        uncached_by_file: dict[str, int] = {}
         for i, f in enumerate(listing.files, start=1):
             self._update(current_file=f.rel_path)
             modified = datetime.fromtimestamp(f.mtime)
@@ -221,6 +222,7 @@ class ScanService:
             else:
                 file_id = store.add_file(sha256=digest, **common)
                 if uncached:
+                    uncached_by_file[f.rel_path] = uncached
                     self._warn(
                         f"{f.rel_path}: 계산값이 저장되지 않은 수식 {uncached}개는 빈 값으로 처리됨"
                         " (엑셀에서 열어 저장하면 해결)"
@@ -260,6 +262,12 @@ class ScanService:
             )
         for rel, info in catalog.assign_freshness(facts).items():
             store.set_freshness(rel, info["fresh"], info["copy_of"], info["data_date"])
+            store.file_info[rel] = {
+                "tie_with": info.get("tie_with", []),
+                "newer": info.get("newer"),
+                "locked": listing.locked.get(rel),
+                "uncached": uncached_by_file.get(rel, 0),
+            }
         return store
 
     def _sheet_warnings(self, rel: str, sh) -> None:
@@ -316,6 +324,7 @@ class ScanService:
                     "copy_of": f["copy_of"],
                     "data_date": f["data_date"],
                     "error": f["error"],
+                    "editing": store.file_info.get(f["rel_path"], {}).get("locked"),
                 }
             )
         base.update(total=len(files), files=files)

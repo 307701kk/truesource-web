@@ -43,7 +43,15 @@ _PATTERNS = [
 _INJECTION = re.compile(
     r"(ignore (all |any )?(previous|prior|above) (instructions|prompts?)|disregard .{0,30}instructions"
     r"|이전\s*(지시|명령|지침)(사항)?\s*(을|를)?\s*(모두\s*)?(무시|잊)|시스템\s*프롬프트|system prompt"
-    r"|api[\s_-]*key|apikey|비밀\s*키|위\s*지시를?\s*무시)",
+    r"|api[\s_-]*key|apikey|비밀\s*키|위\s*지시를?\s*무시"
+    # text that talks to an AI instead of describing business data
+    r"|\[?\s*(AI|LLM|인공지능)\s*(에이전트|어시스턴트|비서)?(에게|야|님)?\s*\]"
+    r"|(AI|LLM|에이전트|어시스턴트)(에게|한테)\s*(전달|지시|명령|알림|안내)"
+    r"|시스템\s*안내\s*[:：]"
+    # attempts to switch off the checks or to fix the grade
+    r"|교차\s*검증을?\s*(생략|건너뛰|하지\s*마|무시)"
+    r"|신뢰도[를은]?\s*(항상\s*)?['\"“‘]?(높음|낮음|보통)['\"”’]?\s*(으로|로)\s*(표시|보고|답|출력)"
+    r"|(0원|전부|모든\s*매출)\S*\s*(으로\s*)?보고(할|하라|해))",
     re.IGNORECASE,
 )
 FORBIDDEN_KEYS = {"raw_rows", "raw", "cells", "records"}
@@ -297,7 +305,7 @@ class Gateway:
                     ) from exc
                 if code == 429:
                     raise GatewayError(
-                        "Gemini 요청 한도(분당 호출 수)를 넘었습니다. 잠시 후 다시 질문하세요."
+                        "Gemini 요청 한도(분당 또는 일일 호출 수)를 넘었습니다. 잠시 후 다시 질문하거나 API 요금제·한도를 확인하세요."
                     ) from exc
                 raise GatewayError(f"Gemini API 오류({code}): {detail}") from exc
         raise GatewayError("Gemini API 호출에 실패했습니다.") from last

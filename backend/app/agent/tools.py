@@ -11,9 +11,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
-from .. import config
+from openpyxl.utils import get_column_letter
+
+from .. import catalog, config
 from ..store import Store, quote_ident
-from . import glossary
+from . import glossary, rules
+from .audits import EXCERPT, AuditMixin
 
 TOOL_LABELS = {
     "lookup_terms": "용어 조회",
@@ -72,6 +75,35 @@ class QuestionCtx:
     final: dict | None = None
     number_check: str = "none"  # none | ok | failed
     number_retries: int = 0
+    bad_numbers: list[str] = field(default_factory=list)
+    unregistered: list[str] = field(default_factory=list)
+    no_data: dict | None = None  # set by the runner when nothing relevant was found
+    catalog_searches: list[dict] = field(default_factory=list)  # [{columns, found}]
+    value_searches: list[dict] = field(default_factory=list)  # [{text, found}]
+    findings: list[dict] = field(default_factory=list)  # raised confidence rules (rules.py)
+    period: dict | None = None
+    audited_files: set[str] = field(default_factory=set)
+    audited_tables: set[str] = field(default_factory=set)
+    audited_inject: set[str] = field(default_factory=set)
+    budget_hit: bool = False
+    unstructured: bool = False
+    _seen: set = field(default_factory=set)
+
+    def flag(self, rule_id: str, where: dict | None = None, **detail) -> dict | None:
+        """Raise a confidence rule once per (rule, place). Returns the finding if it is new."""
+        f = rules.make_finding(rule_id, where, **detail)
+        key = (
+            rule_id,
+            (where or {}).get("path"),
+            (where or {}).get("sheet"),
+            (where or {}).get("rows"),
+            f["title"],
+        )
+        if key in self._seen:
+            return None
+        self._seen.add(key)
+        self.findings.append(f)
+        return f
 
     def step(self, tool: str, detail: str, status: str = "ok") -> None:
         self.trace.append({"step": TOOL_LABELS.get(tool, tool), "detail": detail, "status": status})
@@ -104,12 +136,17 @@ def _unit_mult(preamble: list[str]) -> int:
     return 1
 
 
-class ToolBox:
+class ToolBox(AuditMixin):
     def __init__(
-        self, store: Store, ctx: QuestionCtx, glossary_extra: list[dict] | None = None
+        self,
+        store: Store,
+        ctx: QuestionCtx,
+        glossary_extra: list[dict] | None = None,
+        root: str | None = None,
     ) -> None:
         self.store = store
         self.ctx = ctx
+        self.root = root
         self.glossary_extra = glossary_extra or []
         self._meta: dict[str, dict] = {}
         self._all_columns: set[str] | None = None
@@ -122,7 +159,8 @@ class ToolBox:
             raise ValueError(f"표 이름이 올바르지 않습니다: {table}")
         rows = self.store.query(
             "SELECT f.rel_path, f.name, f.dept, f.modified, f.fresh, f.copy_of, f.data_date,"
-            " s.sheet_name, s.preamble FROM sheets s JOIN files f ON f.file_id=s.file_id"
+            " s.sheet_name, s.preamble, f.size, s.hidden, s.error_cells, s.mixed_columns, s.truncated,"
+            " s.header_row FROM sheets s JOIN files f ON f.file_id=s.file_id"
             " WHERE s.table_name=?",
             [table],
         )
@@ -130,12 +168,12 @@ class ToolBox:
             raise ValueError(f"해당 표가 없습니다: {table}")
         r = rows[0]
         preamble = json.loads(r[8] or "[]")
-        cols = {
-            c[0]: c[1]
-            for c in self.store.query(
-                "SELECT name, dtype FROM columns WHERE table_name=? ORDER BY ordinal", [table]
-            )
-        }
+        col_rows = self.store.query(
+            "SELECT name, dtype, source_col FROM columns WHERE table_name=? ORDER BY ordinal",
+            [table],
+        )
+        cols = {c[0]: c[1] for c in col_rows}
+        letters = {c[0]: get_column_letter(c[2]) for c in col_rows}
         meta = {
             "table": table,
             "path": r[0],
@@ -149,6 +187,13 @@ class ToolBox:
             "preamble": preamble,
             "unit_mult": _unit_mult(preamble),
             "columns": cols,
+            "letters": letters,
+            "size": r[9],
+            "hidden": bool(r[10]),
+            "error_cells": r[11] or 0,
+            "mixed": json.loads(r[12] or "[]"),
+            "truncated": bool(r[13]),
+            "header_row": r[14],
         }
         self._meta[table] = meta
         return meta
@@ -171,12 +216,6 @@ class ToolBox:
     def _title(self, meta: dict) -> str:
         return meta["preamble"][0] if meta["preamble"] else ""
 
-    def _flag_version(self, meta: dict) -> None:
-        if meta["fresh"] == "stale":
-            self.ctx.stale_used.add(meta["file"])
-        elif meta["fresh"] == "copy":
-            self.ctx.copy_used.add(meta["file"])
-
     # ------------------------------------------------------------------ 1. lookup_terms
     def lookup_terms(self, terms: list[str]) -> dict:
         cols = self.all_columns()
@@ -194,11 +233,14 @@ class ToolBox:
             m = glossary.match_term(t, cols, self.glossary_extra)
             mappings.append(m | {"input": t})
             self.ctx.term_grades.add(m["grade"])
+            if m["grade"] == "미등록" and t not in self.ctx.unregistered:
+                self.ctx.unregistered.append(t)
         detail = ", ".join(
             f"{m['input']}→{'/'.join(m['columns'][:2]) or '?'}({m['grade']})" for m in mappings
         )
         if period:
             detail += f"{', ' if detail else ''}{period['text']}→{period['start']}~{period['end']}"
+        self.ctx.period = period or self.ctx.period
         self.ctx.step(
             "lookup_terms", detail or "-", "warn" if "미등록" in self.ctx.term_grades else "ok"
         )
@@ -273,6 +315,7 @@ class ToolBox:
         # newest data first, so the current base file is the first candidate
         cands.sort(key=lambda c: c["data_date"] or c["modified"], reverse=True)
         cands = cands[:12]
+        self.ctx.catalog_searches.append({"columns": want, "found": len(cands)})
         self.ctx.step(
             "search_catalog",
             f"후보 {len(cands)}개, 제외 {len(excluded)}개",
@@ -298,6 +341,7 @@ class ToolBox:
                     "path": h["file"],
                     "sheet": h["sheet"],
                     "column": h["column"],
+                    "letter": meta["letters"].get(h["column"], "?"),
                     "dept": meta["dept"],
                     "fresh": meta["fresh"],
                     "modified": meta["modified"].strftime("%m-%d"),
@@ -311,9 +355,11 @@ class ToolBox:
                 g["first_rows"].append(h["row"])
         out = sorted(groups.values(), key=lambda g: (g["fresh"] != "ok", -g["hits"]))[:15]
         for g in out:  # local-only snippet for the UI (never sent to the LLM)
+            self.file_audit(self.table_meta(g["_table"]))
             self.ctx.search_hits.append(
                 {**g, "snippet": self._snippet(g["_table"], g["first_rows"][0]), "exact": exact}
             )
+        self.ctx.value_searches.append({"text": text, "found": len(out)})
         self.ctx.step(
             "search_value", f"'{text}' 위치 {len(out)}곳 ({len(hits)}건)", "ok" if out else "warn"
         )
@@ -453,9 +499,17 @@ class ToolBox:
         raw = self.store.query(
             f"SELECT {sel}{(' FROM ' + table)} WHERE {where}{grp}{order} LIMIT {n_limit}", params
         )
-        src = self.store.query(
-            f"SELECT min(_row), max(_row), count(*) FROM {table} WHERE {where}", params
-        )[0]
+        rows_used = [
+            r[0]
+            for r in self.store.query(
+                f"SELECT _row FROM {table} WHERE {where} ORDER BY _row LIMIT 20000", params
+            )
+        ]
+        src = (
+            rows_used[0] if rows_used else None,
+            rows_used[-1] if rows_used else None,
+            len(rows_used),
+        )
         mult = meta["unit_mult"]
         out_rows = []
         for r in raw:
@@ -476,7 +530,18 @@ class ToolBox:
         qid = f"q{len(self.ctx.queries) + 1}"
         if not out_rows or src[2] == 0:
             self.ctx.anomalies["empty"] = True
-        self._flag_version(meta)
+        before = len(self.ctx.findings)
+        self.file_audit(meta)
+        used = [*group_by, *(s["column"] for s in specs if s["column"])]
+        self.row_audit(
+            meta,
+            where,
+            params,
+            list(dict.fromkeys(used)),
+            [s["column"] for s in specs if s["agg"] == "sum" and s["column"]],
+            rows_used,
+        )
+        raised = [f["title"] for f in self.ctx.findings[before:] if f["severity"] != rules.INFO]
         res = {
             "query_id": qid,
             "table": table,
@@ -489,22 +554,27 @@ class ToolBox:
             "group_by": group_by,
             "metrics": [s["label"] for s in specs],
             "result": out_rows,
+            # what the rules found in this data (the LLM may mention them; code shows them anyway)
+            "data_warnings": raised[:6],
         }
         self.ctx.queries[qid] = res | {
             "_group_by": group_by,
             "_metric": specs[0]["label"],
             "_money": specs[0]["money"],
+            "_path": meta["path"],
+            "_data_date": meta["data_date"],
+            "_title": self._title(meta),
+            "_family": catalog.family_stem(meta["file"]),
+            "_dept": meta["dept"],
         }
-        first, last = src[0], src[1]
         self.ctx.sources.append(
-            {
-                "file": meta["file"],
-                "sheet": meta["sheet"],
-                "row": f"{first}~{last}행" if first != last else f"{first}행",
-                "modified": meta["modified"].strftime("%m-%d %H:%M"),
-                "indexed": self.ctx.indexed_at,
-                "path": meta["path"],
-            }
+            self._source(
+                meta,
+                rows_used,
+                [*group_by, *(s["column"] for s in specs if s["column"])],
+                qid,
+                "계산 근거",
+            )
         )
         self.ctx.step(
             "run_query",
@@ -512,6 +582,28 @@ class ToolBox:
             "warn" if self.ctx.anomalies.get("empty") else "ok",
         )
         return res
+
+    def _source(
+        self, meta: dict, rows: list[int], cols: list[str], qid: str | None, role: str
+    ) -> dict:
+        """One evidence entry: which file, sheet, rows and columns, and how fresh the file is."""
+        w = self.where_dict(meta, rows, cols)
+        info = self.store.file_info.get(meta["path"], {})
+        return {
+            "file": meta["file"],
+            "path": meta["path"],
+            "sheet": meta["sheet"],
+            "row": (w.get("rows", "") + "행") if rows else "-",
+            "row_count": len(rows),
+            "cells": w.get("cells", ""),
+            "header_row": meta["header_row"],
+            "modified": meta["modified"].strftime("%m-%d %H:%M"),
+            "indexed": self.ctx.indexed_at,
+            "fresh": meta["fresh"],
+            "editing": info.get("locked"),
+            "role": role,
+            "query_id": qid,
+        }
 
     # ------------------------------------------------------------------ 5. cross_verify
     def cross_verify(self, query_a: str, query_b: str) -> dict:
@@ -523,6 +615,15 @@ class ToolBox:
         if a["table"] == b["table"]:
             return {
                 "error": "같은 표를 다시 계산하는 것은 교차검증이 아닙니다. 다른 파일(다른 표)로 같은 지표를 계산하세요."
+            }
+        if a["_family"] == b["_family"] and a["_dept"] == b["_dept"]:
+            return {
+                "error": "같은 계열의 파일(버전·사본·서식만 다른 파일)끼리의 비교는 독립된 교차검증이 아닙니다. "
+                "다른 부서·다른 종류의 파일(예: 집계 파일 대 거래 원장)로 계산하세요."
+            }
+        if EXCERPT.search(a["_title"]) or EXCERPT.search(b["_title"]):
+            return {
+                "error": "'발췌'·'복사'로 만든 파일은 원본을 옮겨 적은 것이라 독립된 검증이 아닙니다. 원본 자료와 비교하세요."
             }
 
         def keyed(q: dict) -> dict[str, float]:
@@ -541,10 +642,11 @@ class ToolBox:
         money = a["_money"] and b["_money"]
         rank_a = {k: i for i, k in enumerate(sorted(common, key=lambda k: -(ka[k] or 0)), 1)}
         rank_b = {k: i for i, k in enumerate(sorted(common, key=lambda k: -(kb[k] or 0)), 1)}
-        diffs, match = [], True
+        diffs, match, max_rel = [], True, 0.0
         for k in common:
             va, vb = ka[k] or 0, kb[k] or 0
             rel = abs(va - vb) / max(abs(va), abs(vb), 1e-9)
+            max_rel = max(max_rel, rel)
             same = rel <= config.CROSS_TOLERANCE
             match &= same
             diffs.append(
@@ -560,7 +662,36 @@ class ToolBox:
                 }
             )
         rank_changed = rank_a != rank_b
-        self.ctx.cross = {"match": match, "rank_changed": rank_changed}
+        only_a = [k for k in ka if k not in kb]
+        only_b = [k for k in kb if k not in ka]
+        sum_a, sum_b = sum(abs(ka[k] or 0) for k in common), sum(abs(kb[k] or 0) for k in common)
+        ratio = (sum_a / sum_b) if sum_a and sum_b else 1.0
+        unit_suspect = None
+        if max_rel > 0.5:  # such a gap is usually a unit (천원/백만원) problem, not a data problem
+            for k_pow in (3, 4, 6, 8):
+                if any(abs(r / 10**k_pow - 1) < 0.05 for r in (ratio, 1 / ratio)):
+                    unit_suspect = 10**k_pow
+        dates = {a["_data_date"], b["_data_date"]}
+        self.ctx.cross = {
+            "match": match,
+            "rank_changed": rank_changed,
+            "max_rel": max_rel,
+            "date_gap": (
+                f"{a['file']} {a['_data_date']} vs {b['file']} {b['_data_date']}"
+                if len(dates) > 1
+                else None
+            ),
+        }
+        loc = {"file": f"{a['file']} ↔ {b['file']}"}
+        if only_a or only_b:
+            self.ctx.flag("X5", loc, keys=", ".join([*only_a, *only_b][:5]))
+        if unit_suspect:
+            self.ctx.flag("X6", loc, ratio=f"{unit_suspect:,}")
+        for src in self.ctx.sources:  # label the evidence by role
+            if src.get("query_id") == query_a:
+                src["role"] = "계산 근거 (기준)"
+            elif src.get("query_id") == query_b:
+                src["role"] = "교차검증 대조"
         mismatches = [d for d in diffs if not d["same"]]
         self.ctx.step(
             "cross_verify",
@@ -568,14 +699,20 @@ class ToolBox:
             + (", 순위 변동" if rank_changed else ""),
             "ok" if match else "warn",
         )
-        return {
+        out = {
             "files": {"a": a["file"], "b": b["file"]},
+            "data_dates": {"a": a["_data_date"], "b": b["_data_date"]},
             "match": match,
             "rank_changed": rank_changed,
             "tolerance": "1%",
             "items": diffs,
             "note": "rank_changed=true 이면 결론이 바뀌는 불일치입니다. 원인을 trace_difference 로 조사하세요.",
         }
+        if only_a or only_b:
+            out["only_in_a"], out["only_in_b"] = only_a[:10], only_b[:10]
+        if unit_suspect:
+            out["unit_suspect"] = f"약 {unit_suspect:,}배 차이: 단위(천원/백만원) 불일치 가능성"
+        return out
 
     # ------------------------------------------------------------------ 6. trace_difference
     def trace_difference(
@@ -604,9 +741,13 @@ class ToolBox:
                 f" FROM {table} WHERE {where}{' GROUP BY ' + gb if gb else ''} ORDER BY 2 LIMIT {config.MAX_GROUP_ROWS}",
                 params,
             )
-            ev = self.store.query(
-                f"SELECT min(_row), max(_row), count(*) FROM {table} WHERE {where}", params
-            )[0]
+            ev_rows = [
+                r[0]
+                for r in self.store.query(
+                    f"SELECT _row FROM {table} WHERE {where} ORDER BY _row LIMIT 5000", params
+                )
+            ]
+            ev = (None, None, len(ev_rows))
         except Exception as exc:
             self.ctx.step("trace_difference", f"실패: {str(exc)[:80]}", "warn")
             return {"error": str(exc)[:300]}
@@ -626,16 +767,15 @@ class ToolBox:
         self.ctx.traced = True
         if ev[2]:
             self.ctx.sources.append(
-                {
-                    "file": meta["file"],
-                    "sheet": meta["sheet"],
-                    "row": f"{ev[0]}~{ev[1]}행",
-                    "modified": meta["modified"].strftime("%m-%d %H:%M"),
-                    "indexed": self.ctx.indexed_at,
-                    "path": meta["path"],
-                }
+                self._source(
+                    meta,
+                    ev_rows,
+                    [date_column, amount_column, *(group_by or [])],
+                    None,
+                    "차이 추적 근거",
+                )
             )
-            self._flag_version(meta)
+            self.file_audit(meta)
         self.ctx.step(
             "trace_difference", f"{after_date} 이후 {ev[2]}건, 합계 {fmt_won(total)}", "ok"
         )
@@ -679,7 +819,7 @@ class ToolBox:
             qual = self.quality_of(table)
         except Exception as exc:
             return {"error": str(exc)[:300]}
-        self.note_quality(qual)
+        self.file_audit(self.table_meta(table))
         issues = [k for k in ("missing_values", "duplicate_rows") if qual[k]]
         self.ctx.step(
             "check_quality",
@@ -687,14 +827,6 @@ class ToolBox:
             "warn" if issues else "ok",
         )
         return qual
-
-    def note_quality(self, qual: dict) -> None:
-        if qual["missing_values"]:
-            self.ctx.quality_notes.append(
-                f"{qual['file']} 결측 {sum(qual['missing_values'].values())}건 (제외 기록)"
-            )
-        if qual["duplicate_rows"]:
-            self.ctx.quality_notes.append(f"{qual['file']} 완전중복 행 {qual['duplicate_rows']}개")
 
     # ------------------------------------------------------------------ 8. ask_user
     def ask_user(self, question: str, options: list[str] | None = None) -> dict:

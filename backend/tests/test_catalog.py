@@ -59,6 +59,8 @@ def test_freshness_latest_stale_and_copy():
         "fresh": "copy",
         "copy_of": "영업팀/실적집계_v2.xlsx",
         "data_date": "2026-09-28",
+        "newer": None,
+        "tie_with": [],
     }
     assert out["개인/김대리/실적_참고용.xlsx"]["copy_of"] == "영업팀/실적집계_v2.xlsx"
     assert out["물류팀/재고현황_20260930.xlsx"]["fresh"] == "ok"

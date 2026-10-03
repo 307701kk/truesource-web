@@ -6,6 +6,7 @@ import hashlib
 import os
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from . import config
@@ -29,6 +30,8 @@ class ScanListing:
     files: list[ScannedFile] = field(default_factory=list)
     skipped: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # rel path -> {owner, since}: files someone has open right now (Excel / LibreOffice lock)
+    locked: dict[str, dict] = field(default_factory=dict)
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -91,7 +94,11 @@ def list_excel_files(root: Path) -> ScanListing:
             else:
                 keep.append(d)
         dirnames[:] = keep
+        locks: list[str] = []
         for name in sorted(filenames):
+            if name.startswith(".~lock.") and name.endswith("#"):
+                locks.append(name)  # LibreOffice lock file
+                continue
             if name.startswith("._"):
                 continue  # macOS AppleDouble sidecar (not a real workbook); not counted
             ext = os.path.splitext(name)[1].lower()
@@ -102,6 +109,7 @@ def list_excel_files(root: Path) -> ScanListing:
                 continue
             if name.startswith("~$"):
                 listing.skip("lock_file")
+                locks.append(name)
                 continue
             full = Path(dirpath) / name
             try:
@@ -121,6 +129,7 @@ def list_excel_files(root: Path) -> ScanListing:
             # macOS returns decomposed Hangul (NFD); compose it so names match config/regexes
             rel = unicodedata.normalize("NFC", full.relative_to(root).as_posix())
             listing.files.append(ScannedFile(full, rel, st.st_size, st.st_mtime))
+        _mark_locked(listing, dirpath, root, locks)
     return listing
 
 
@@ -130,3 +139,59 @@ def sha256_of(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _lock_target(file_name: str, lock_name: str) -> bool:
+    """Which workbook does this lock file belong to?
+    Excel: '~$' + the file name (long names lose their first 1-2 characters).
+    LibreOffice: '.~lock.<file name>#'."""
+    if lock_name.startswith(".~lock."):
+        return file_name == lock_name[len(".~lock.") : -1]
+    tail = lock_name[2:]
+    return file_name == tail or file_name[1:] == tail or file_name[2:] == tail
+
+
+def read_lock_owner(path: Path) -> str | None:
+    """Name of the person who has the file open, read from the lock file. None if unreadable.
+
+    Excel owner file: byte 0 = length of the ANSI name, then the name; the UTF-16 name sits at
+    offset 56 (length at offset 55). LibreOffice: 'user,host,...' text."""
+    try:
+        data = path.read_bytes()[:256]
+    except OSError:
+        return None
+    if path.name.startswith(".~lock."):
+        text = data.decode("utf-8", errors="ignore").split(",")[0].strip()
+        return text or None
+    if len(data) > 56 and data[55]:
+        n = data[55]
+        name = data[56 : 56 + 2 * n].decode("utf-16-le", errors="ignore").strip("\x00 ")
+        if name.isprintable() and name:
+            return name
+    if data and 0 < data[0] <= 54 and len(data) >= 1 + data[0]:
+        raw = data[1 : 1 + data[0]]
+        for enc in ("utf-8", "cp949"):
+            try:
+                name = raw.decode(enc).strip()
+            except UnicodeDecodeError:
+                continue
+            if name and name.isprintable():
+                return name
+    return None
+
+
+def _mark_locked(listing: ScanListing, dirpath: str, root: Path, locks: list[str]) -> None:
+    if not locks:
+        return
+    here = [f for f in listing.files if f.abs_path.parent == Path(dirpath)]
+    for lock in locks:
+        lock_path = Path(dirpath) / lock
+        for f in here:
+            if _lock_target(f.abs_path.name, lock):
+                try:
+                    since = datetime.fromtimestamp(lock_path.stat().st_mtime).isoformat(
+                        timespec="minutes"
+                    )
+                except OSError:
+                    since = None
+                listing.locked[f.rel_path] = {"owner": read_lock_owner(lock_path), "since": since}

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { DEPT_ORDER, SORT_MODES } from '../constants'
+import { useOpenFile } from './openFileContext'
 
 // 파일 확장자로 형식 구분 (형식별 정렬용)
 const ext = (name) => (name.match(/\.(\w+)/)?.[1] ?? '기타').toLowerCase()
@@ -19,13 +20,15 @@ function group(files, mode) {
 
 export default function Sidebar({ catalog, sync, usedFiles, profile, onChangeFolder, view, onNav }) {
   const [mode, setMode] = useState('부서별')
+  const open = useOpenFile()
   const pinned = catalog.filter((f) => usedFiles.has(f.name))
   const rest = catalog.filter((f) => !usedFiles.has(f.name))
 
   const row = (f, isPinned) => (
-    <li key={f.path ?? f.name} title={f.path} className={isPinned ? 'file pinned' : 'file'}>
+    <li key={f.path ?? f.name} title={`${f.path} (클릭하면 엑셀로 열립니다)`} className={isPinned ? 'file pinned' : 'file'} onClick={() => f.path && open(f.path)}>
       <span className={`dot ${f.fresh === 'ok' ? 'fresh' : 'stale'}`} />
       <span className="fname">{isPinned && '★ '}{f.name}</span>
+      {f.editing && <span className="lock" title={f.editing.owner ? `${f.editing.owner}님이 열어 둠` : '다른 사람이 열어 둠'}>✎</span>}
     </li>
   )
 

@@ -51,6 +51,7 @@ def test_scan_flow_and_catalog_contract(client, share):
         "copy_of",
         "data_date",
         "error",
+        "editing",
     }
     assert (v2["dept"], v2["fresh"], v2["rows"], v2["modified"]) == (
         "영업팀",

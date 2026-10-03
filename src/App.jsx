@@ -6,6 +6,7 @@ import { askQuestion } from './api/askQuestion'
 import SetupScreen from './components/SetupScreen'
 import AuditView from './components/AuditView'
 import HistoryView from './components/HistoryView'
+import { OpenFileProvider } from './components/OpenFile'
 import GlossaryView from './components/GlossaryView'
 import { getCatalog, getLlmStatus, login } from './api/backend'
 
@@ -96,6 +97,7 @@ export default function App() {
   }
 
   return (
+    <OpenFileProvider>
     <div className="app">
       <Sidebar
         catalog={setup.catalog.files}
@@ -132,5 +134,6 @@ export default function App() {
         </>)}
       </main>
     </div>
+    </OpenFileProvider>
   )
 }
