@@ -37,6 +37,10 @@ class ScanService:
         self._scan_id = 0
         self._status = self._blank_status()
         self.scanned_path: str | None = None
+        self.scan_company: str | None = None  # company whose folder is loaded
+        self.sync: dict | None = None  # last sync summary (added / modified / deleted / moved)
+        self.on_complete = None  # callback(company, path, fingerprints, sheets, rows) -> sync dict
+        self._listing_fp: dict = {}  # cheap fingerprint of the last scan (periodic check)
 
     @staticmethod
     def _blank_status() -> dict:
@@ -56,10 +60,12 @@ class ScanService:
             "started_at": None,
             "finished_at": None,
             "message": None,
+            "company": None,
+            "sync": None,
         }
 
     # ------------------------------------------------------------ control
-    def start(self, raw_path: str, *, background: bool = True) -> dict:
+    def start(self, raw_path: str, *, background: bool = True, company: str | None = None) -> dict:
         root = validate_scan_path(raw_path)  # raises ScanPathError
         with self._lock:
             if self._status["state"] == "running":
@@ -70,16 +76,17 @@ class ScanService:
                 state="running",
                 scan_id=self._scan_id,
                 path=str(root),
+                company=company,
                 started_at=_fmt_time(datetime.now()),
             )
             scan_id = self._scan_id
         if background:
             self._thread = threading.Thread(
-                target=self._run, args=(root, scan_id), daemon=True, name="scan"
+                target=self._run, args=(root, scan_id, company), daemon=True, name="scan"
             )
             self._thread.start()
         else:
-            self._run(root, scan_id)
+            self._run(root, scan_id, company)
         return self.status()
 
     def wait(self, timeout: float | None = None) -> None:
@@ -109,17 +116,22 @@ class ScanService:
                 self._status["errors"].append({"file": rel, "message": msg})
 
     # ------------------------------------------------------------ the scan
-    def _run(self, root: Path, scan_id: int) -> None:
+    def _run(self, root: Path, scan_id: int, company: str | None = None) -> None:
         try:
             listing = list_excel_files(root)
             self._update(files_total=len(listing.files), skipped=dict(listing.skipped))
             for w in listing.warnings:
                 self._warn(w)
             store = self._load(listing)
+            sync = self._finish_sync(company, root, store)
             with self._lock:
                 self.store = store
                 self.scanned_path = str(root)
+                self.scan_company = company
+                self.sync = sync
+                self._listing_fp = {f.rel_path: (f.size, f.mtime) for f in listing.files}
                 self._status.update(
+                    sync=sync,
                     state="done",
                     percent=100,
                     current_file=None,
@@ -132,6 +144,44 @@ class ScanService:
                 finished_at=_fmt_time(datetime.now()),
                 message=f"스캔 중 오류: {exc.__class__.__name__}",
             )
+
+    def _finish_sync(self, company: str | None, root: Path, store: Store) -> dict | None:
+        """Save the scan for the company (fingerprints + sync log); returns the diff summary."""
+        if not (company and self.on_complete):
+            return None
+        fp = {
+            r[0]: (r[1], r[2].isoformat(timespec="seconds"), r[3])
+            for r in store.query("SELECT rel_path, size, modified, sha256 FROM files")
+        }
+        st = self.status()
+        try:
+            return self.on_complete(company, str(root), fp, st["sheets"], st["data_rows"])
+        except Exception:  # a storage problem must not fail the scan itself
+            log.exception("could not record scan for company")
+            return None
+
+    def auto_sync_once(self) -> bool:
+        """Periodic check: re-scan if files in the loaded folder changed. True if a scan started."""
+        with self._lock:
+            path, company, last, busy = (
+                self.scanned_path,
+                self.scan_company,
+                self._listing_fp,
+                self._status["state"] == "running",
+            )
+        if not path or busy:
+            return False
+        try:
+            listing = list_excel_files(Path(path))
+        except OSError:
+            return False
+        if {f.rel_path: (f.size, f.mtime) for f in listing.files} == last:
+            return False
+        try:
+            self.start(path, company=company)
+        except (ScanBusyError, ScanPathError):
+            return False
+        return True
 
     def _load(self, listing: ScanListing) -> Store:
         store = Store()
@@ -232,7 +282,10 @@ class ScanService:
 
     def catalog(self) -> dict:
         store, scanned_path, status = self._snapshot()
-        return self._catalog_from(store, scanned_path, status)
+        out = self._catalog_from(store, scanned_path, status)
+        with self._lock:
+            out.update(company=self.scan_company, sync=self.sync)
+        return out
 
     @staticmethod
     def _catalog_from(store: Store | None, scanned_path: str | None, status: dict) -> dict:

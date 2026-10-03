@@ -1,16 +1,185 @@
-# React + Vite
+# 트루소스 (TrueSource)
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+중소기업 실무자가 **사내 엑셀 데이터에 묻고, 받은 숫자를 믿기 전에 확인**하는 AI 에이전트.
+원본 데이터는 사내 PC에서만 다뤄지고, 외부 LLM(Gemini)은 판단만 맡습니다.
+설계 배경은 `파이프라인.pdf`(트루소스 AI 에이전트 동작 설계서)를 따릅니다.
 
-Currently, two official plugins are available:
+| 사용 방식 | 예시 |
+| --- | --- |
+| 질문형 | "3분기 실적 3등이 무슨 팀이야?" |
+| 검증형 | "보고서에 영업2팀이 3위라던데 맞아?" |
+| 찾기형 | "대성기계 관련 자료 찾아줘" |
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## 실행
 
-## React Compiler
+```bash
+# 1) 백엔드 (FastAPI + DuckDB)
+cd backend
+python3 -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env        # GEMINI_API_KEY 를 채운다 (.env 는 git 에 올라가지 않음)
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+# 2) 프론트 (React + Vite, /api 는 8000 포트로 프록시)
+npm install
+npm run dev                 # http://127.0.0.1:5173
+```
 
-## Expanding the Oxlint configuration
+1. 시작 화면에서 회사명·이름·소속·직책을 입력하고, **공유폴더 경로**(예: `…/가온산업_가상데이터/공유폴더`)를 입력합니다.
+   채점용 `정답지/` 폴더는 포함하지 않도록 `공유폴더`까지만 지정하세요.
+2. 백엔드가 엑셀을 읽기 전용으로 스캔해 인메모리 DuckDB에 저장합니다 (가온산업 138개 파일 → 약 4초).
+3. 질문하면 에이전트가 답합니다. 사이드바의 **감사 로그**에서 외부 LLM으로 실제 나간 내용을 볼 수 있습니다.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+설정(`backend/.env`): `GEMINI_API_KEY`, `GEMINI_MODEL`(기본 `gemini-3.8-flash`), 선택으로
+`TRUESOURCE_DATA_DIR`(회사 DB 위치, 기본 `backend/data`), `TRUESOURCE_SYNC_SECONDS`(주기 스캔 간격, 기본 600초, 0이면 끔).
+Gemini 무료 한도에서는 분당 호출 제한(429)에 걸릴 수 있어, 서버가 알려주는 대기 시간만큼 기다렸다가 자동 재시도합니다(질문 하나에 LLM 호출이 여러 번).
+
+## 구조
+
+```
+src/                      React 화면 (시작 화면, 질문/결과 레이아웃 3종, 되묻기, 감사 로그)
+backend/app/
+  scanner.py converter.py store.py catalog.py service.py   데이터 계층: 폴더 스캔 → 시트별 표 → DuckDB
+  companydb.py       회사별 SQLite: 사용자, 질문 이력, 회사 용어사전, 파일 지문, 동기화 로그
+  agent/
+    gateway.py     보안 게이트웨이: 외부 LLM 호출은 전부 여기 한 함수(call_llm)만 통과
+    runner.py      에이전트 루프(Gemini 함수 호출) + 규칙 강제 + 응답 조립
+    tools.py       도구 8개 (전부 로컬 코드)
+    glossary.py    용어사전(시드)·기간 규칙
+    confidence.py  신뢰도 규칙표 (코드가 판정)
+    numbers.py     답변 속 숫자 재대조
+```
+
+데이터 계층 상세는 [backend/README.md](backend/README.md).
+
+## 에이전트가 굴러가는 방식
+
+핵심 원칙: **LLM은 판단하고, 코드는 판정한다.** LLM이 하는 일은 ① 계획(어떤 도구를 어떤 순서로) ② 근거가 충분한지 판단 ③ 답변 작성, 세 가지뿐입니다.
+계산·출처·신뢰도·숫자 검증은 전부 코드가 합니다.
+
+```
+질문 ─▶ [LLM] 계획 ─▶ 도구 호출(로컬 코드) ─▶ 결과 요약만 LLM에 전달 ─┐
+          ▲                                                           │
+          └────────── 근거가 부족하면 도구 추가 호출·재계획 ◀──────────┘
+충분 ─▶ [LLM] final_answer ─▶ 코드: 규칙 검사 · 숫자 재대조 ─▶ 코드: 신뢰도 판정·출처·실행과정 조립 ─▶ 화면
+```
+
+다음 행동은 코드가 미리 정하지 않고 LLM이 도구 결과를 보고 정합니다(Gemini 함수 호출). 단 **자율성의 경계는 코드가 강제**합니다.
+
+### 도구 8개 (모두 로컬)
+
+| 도구 | 하는 일 | LLM이 받는 것 |
+| --- | --- | --- |
+| `lookup_terms` | 질문 속 용어·기간을 용어사전으로 컬럼·날짜 범위에 매핑 | 매핑 컬럼, 일치 등급(정확·동의어·미등록), 기간 |
+| `search_catalog` | 필요한 컬럼을 가진 시트 검색. 구버전·사본은 `excluded`로 분리 | 후보 표(table), 컬럼, 날짜 범위, 단위, 신선도 |
+| `search_value` | 특정 값(팀명·거래처명)이 있는 위치 검색 | 파일·시트·컬럼·건수 (행 내용 없음) |
+| `run_query` | JSON 명세를 검증해 집계 실행(원본 행은 반환 안 함). 금액은 원 단위로 환산 | 집계값, 사용 행 수, 순위 |
+| `cross_verify` | 같은 지표를 다른 파일(다른 표)의 결과와 비교 | 일치 여부, 차이, 순위 변동 |
+| `trace_difference` | 기준일 이후 입력된 거래를 묶어 불일치 원인 후보 제시 | 건수·합계 |
+| `check_quality` | 결측·중복·버전 상태 | 품질 요약 |
+| `ask_user` | 모호한 용어·기준을 사용자에게 되묻기 (처리를 멈추고 답을 기다림) | 사용자 응답 |
+
+### 코드가 강제하는 규칙
+
+- 도구 호출 총 **10회** 상한 (초과 시 `final_answer`만 허용)
+- `run_query` 실패 재시도 **2회** (초과 시 실행 이상 → 신뢰도 낮음)
+- 계산을 했다면 **교차검증 없이는 `final_answer` 불가** (다른 파일의 다른 표여야 인정). 계산이 없는 질문(찾기형)은 예외이며 신뢰도에 "교차검증 불가"로 표시
+- 답변 속 숫자(억·만원·원·%·소수)는 **도구 결과에 없으면 거절**하고 재작성(최대 2회). 끝내 불일치하면 신뢰도를 낮춤
+- 원본 행은 LLM에 안 감: 식별자 컬럼(전표번호 등)으로 묶기 금지, 결과 30행 초과 시 거절, 목록 60개 초과·`raw_rows` 필드는 게이트웨이가 차단
+
+### 신뢰도 (LLM의 "확신해요"는 쓰지 않음)
+
+4개 신호를 코드가 규칙으로 판정하고 **가장 낮은 등급**이 최종 등급입니다. 사유 문장도 코드가 만듭니다.
+
+| 신호 | 높음 | 보통 | 낮음 |
+| --- | --- | --- | --- |
+| ① 매핑 확신도 | 모두 정확·동의어 | 기본값 적용(연도 등) | 미등록 표현을 추정 |
+| ② 교차검증 | 전부 일치(오차 1% 이내) | 불일치지만 순위 같음 / 교차검증 불가 | **순위가 바뀜(결론 변경)** / 계산했으나 검증 못함 |
+| ③ 데이터 품질 | 문제 없음 | 결측·중복·사본 사용 | 구버전 파일 사용 |
+| ④ 실행 이상 | 없음 | 재시도 후 해결·빈 결과·음수 합계 | 재시도 후에도 실패 |
+
+"결론 변경"은 현재 **교차검증에서 순위가 달라지는지**로 판정합니다. 원인을 `trace_difference`로 특정하면 사유에 "(원인 확인됨)"이 붙습니다.
+
+### 보안 게이트웨이 (`agent/gateway.py`)
+
+모든 LLM 호출은 `call_llm` 한 곳을 지납니다.
+
+1. 권한 확인 — 사용자 정보와 허용된 호출 목적
+2. 허용 필드 검사 — 스키마·집계값만, 원본 행 형태는 차단
+3. 마스킹 — 값 색인에서 알아낸 팀·거래처·담당자명을 `{팀1}`, `{거래처3}`으로, 사업자번호·전화·이메일은 정규식으로 치환
+4. 인젝션 문구 차단 — "이전 지시 무시", "시스템 프롬프트" 등은 `[차단됨]`으로 치환
+5. 감사 로그 기록 — **외부로 나간 마스킹 후 내용**을 그대로 저장 (`GET /api/audit`, 화면의 감사 로그)
+6. Gemini API 호출
+7. 응답의 자리표시자를 **로컬에서만** 실명으로 복원 (도구 인자도 복원되어 실제 값으로 실행됨)
+
+### 회사별 저장소와 동기화
+
+회사마다 SQLite 파일이 따로 생깁니다 (`backend/data/<회사해시>/company.db`, git 제외). 다른 회사의 질문·용어는 보이지 않습니다.
+
+| 저장 | 내용 |
+| --- | --- |
+| 사용자 | 로그인 시 이름·소속·직책 등록 |
+| 최근 질문 | 질문과 **답변 전체**(근거·출처·신뢰도·실행 과정). 화면의 "최근 질문"에서 그대로 다시 열기 |
+| 용어사전 | 회사가 추가한 용어(동의어·컬럼 후보). 기본 용어보다 먼저 적용되어 에이전트의 `lookup_terms`가 바로 사용 |
+| 파일 지문·동기화 로그 | 스캔마다 경로·크기·수정시각·해시 저장, 이전 스캔과 비교한 결과를 기록 |
+
+분석된 엑셀 데이터 자체는 인메모리 DuckDB에 있어 백엔드를 재시작하면 다시 스캔해야 합니다. 로그인하면 마지막 폴더 경로가 채워집니다.
+
+**변경 동기화**(코드 전담, LLM 관여 없음): 스캔이 끝날 때마다 지문을 비교해 `추가 / 수정 / 삭제 / 이동`을 셉니다 (같은 해시로 경로만 바뀌면 이동).
+사이드바에 "동기화 · 추가 3 · 수정 1 · 삭제 0"으로 보이고 `GET /api/scan/log`에 이력이 남습니다.
+백엔드는 기본 10분마다 폴더의 파일 목록·크기·수정시각만 훑어, 달라졌을 때만 다시 스캔합니다(질문 중이던 대화는 유지).
+
+### 기억
+
+- 세션별로 직전 질문·답변을 요약해 이어받습니다 ("그럼 2위는?"). 도구 결과는 다음 질문에 재전송하지 않습니다.
+- 되묻기(`ask_user`)의 답도 같은 세션에서 이어집니다.
+- 새 폴더를 스캔하면 세션은 초기화됩니다.
+
+### 대표 흐름: "3분기 실적 3등이 무슨 팀이야?" (가온산업 실데이터)
+
+1. `lookup_terms` — 실적→매출실적(동의어), 팀→팀명, 3분기→7/1~9/30, 연도는 기본값 2026
+2. `search_catalog` — 집계 파일(`실적집계_v2`, 9/28)과 매출원장(9/30)을 후보로 선택, `실적집계_최종`·사본은 제외
+3. `run_query` ×2 — 집계 파일 기준 3위 = 해외영업팀
+4. `cross_verify` — 매출원장(반품 합산) 기준 3위 = 영업2팀 → **순위가 바뀌는 불일치**
+5. `trace_difference` — 9/28 이후 입력 거래 중 9/30 반품 1건(-711만 원)이 집계 파일에 미반영
+6. `final_answer` → 코드가 숫자 재대조 → 신뢰도 **낮음**("순위가 바뀜 (원인 확인됨)"), 두 기준 병기
+
+## API
+
+| 메서드 | 경로 | 설명 |
+| --- | --- | --- |
+| POST | `/api/scan` | 공유폴더 스캔 시작 `{"path": "..."}` |
+| GET | `/api/scan/status` · `/api/catalog` | 진행률 · 파일 목록(부서·신선도·사본 관계) |
+| POST | `/api/login` | 회사 DB 열기/생성 + 사용자 등록 → 마지막 폴더, 로드 여부 |
+| POST | `/api/query` | 질문 `{"question", "user", "session_id"}` → 응답(아래). 질문·답변은 회사 DB에 저장 |
+| GET·DELETE | `/api/history` · `/api/history/{id}` | 최근 질문 목록(회사/사용자별) · 저장된 답변 · 삭제 |
+| GET·POST·DELETE | `/api/glossary` | 용어사전(기본 + 회사 추가분) 조회·추가/수정·삭제 |
+| GET | `/api/scan/log` | 회사별 동기화 로그 (추가·수정·삭제·이동) |
+| GET | `/api/audit` | 외부 LLM으로 나간 내용(마스킹 후) |
+| GET | `/api/llm/status` | 키 설정 여부, 사용 모델 |
+
+`/api/query` 응답: `type`(질문형·검증형·찾기형·되묻기), `answer`, `confidence`, `confidence_reason`,
+`confidence_signals`(4신호), `comparison_table`, `claim`, `cause`, `sources`(파일·시트·행·수정시각·색인시각),
+`search_results`, `trace`(실행 과정), `tool_calls`, `number_check`, `session_id`, `history_id`, `ask`(되묻기일 때).
+`type`은 사용한 도구에 따라 코드가 확정합니다(값 검색만 쓰면 찾기형, `claim`이 있으면 검증형).
+
+## 테스트
+
+```bash
+cd backend && pip install -r requirements-dev.txt
+TRUESOURCE_DATASET=<가온산업_가상데이터 경로> pytest -q     # 95개 (데이터셋 없으면 일부 건너뜀)
+ruff check . && ruff format --check .
+```
+
+`tests/test_company.py`는 회사별 격리, 질문 이력, 용어사전, 동기화 로그(추가·수정·삭제·이동), 주기 스캔, 재시작 후 데이터 유지를 검증합니다.
+에이전트 테스트는 LLM만 스크립트로 바꾸고 **실제 게이트웨이(마스킹·감사·인젝션 필터)를 그대로 통과**시킵니다.
+실데이터 3분기 시나리오 전체, 외부 전송 내용에 실명이 없는지, 교차검증 전 답변 거절, 가짜 숫자 거절, 호출·재시도 상한, 원본 행 노출 차단을 검증합니다.
+
+## 알려진 한계
+
+- 분석된 엑셀 데이터(DuckDB)는 인메모리라 백엔드를 재시작하면 다시 스캔해야 합니다. (회사 DB의 이력·용어사전은 유지됩니다.)
+- 한 번에 한 회사의 폴더만 메모리에 올립니다. 로그인 인증은 없습니다(사내 PC 로컬 실행 가정).
+- 서식만 다른 사본(예: `실적집계_v2_천원`)은 사본으로 못 잡아, 독립된 교차검증처럼 보일 수 있습니다.
+- 용어사전은 사용자가 직접 추가합니다. 되묻기 답을 자동으로 사전에 저장하는 기능과 LLM 자동 초안은 아직 없습니다.
+- 값 역색인은 텍스트 열만 대상이며, 마스킹은 값 색인에 있는 이름 + 정규식 패턴 범위입니다.
+- 교차검증이 가능한 질문 유형은 "같은 지표를 두 파일에서 같은 항목으로 묶어 계산"하는 경우입니다.

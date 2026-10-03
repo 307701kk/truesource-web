@@ -8,3 +8,9 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore:Using .httpx. with .starlette.testclient"]
+
+[tool.ruff.lint.per-file-ignores]
+# Korean prompts / tool descriptions / messages are long single strings
+"app/agent/*.py" = ["E501"]
+"app/companydb.py" = ["E501"]  # long SQL strings
+"tests/test_agent.py" = ["E501"]
