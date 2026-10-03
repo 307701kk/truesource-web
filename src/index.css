@@ -90,3 +90,30 @@ button { font: inherit; cursor: pointer; }
 
 .pinned-box { border-left: 3px solid #5b8def; padding-left: 6px; margin-bottom: 8px; }
 .pinned-title { color: #9ec0ff; margin-top: 4px; }
+
+/* 시작 화면 */
+.setup { height: 100%; display: flex; align-items: center; justify-content: center; background: var(--navy); padding: 16px; }
+.setup-card { width: 480px; max-width: 100%; background: #fff; border-radius: 12px; padding: 32px; }
+.setup-card .brand { color: var(--navy); }
+.setup-card .brand small { color: #6b7a99; }
+.setup-card form { display: flex; flex-direction: column; gap: 12px; }
+.setup-card h2 { margin: 0; font-size: 18px; }
+.setup-card p { margin: 0; color: #5b6578; font-size: 13px; line-height: 1.5; }
+.setup-card label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: #44506a; }
+.setup-card input { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; color: #222; }
+.setup-card input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+.setup-card button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 11px; flex: 1; }
+.setup-card button:disabled { background: #a9b8d6; cursor: default; }
+.setup-card button.ghost { background: #EEF2F8; color: #36507f; flex: none; padding: 11px 18px; }
+.setup-card .row { display: flex; gap: 8px; }
+.setup-card .state { margin: 0; text-align: left; font-size: 13px; }
+.progress { display: flex; flex-direction: column; gap: 4px; }
+.progress .bar { height: 8px; background: #E2E6ED; border-radius: 4px; overflow: hidden; }
+.progress .bar span { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+.progress small { color: #5b6578; font-size: 12px; }
+.progress .cur { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8a94a8; }
+
+/* 사이드바 하단 사용자 */
+.profile { border-top: 1px solid rgba(255,255,255,.12); padding-top: 10px; margin-top: 8px; display: flex; flex-direction: column; gap: 2px; font-size: 13px; color: #fff; }
+.profile small { color: #9fb0d0; font-size: 11.5px; }
+.profile button { margin-top: 6px; background: rgba(255,255,255,.1); border: 0; color: #c5d0e6; border-radius: 4px; padding: 5px; font-size: 12px; }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,7 +42,8 @@ def _is_inside(path: Path, parent: Path) -> bool:
 
 def _is_blocked(path: Path) -> bool:
     blocked = config.BLOCKED_DIRS_WINDOWS if os.name == "nt" else config.BLOCKED_DIRS_POSIX
-    return any(_is_inside(path, Path(b)) for b in blocked)
+    # also compare against the resolved form (macOS: /etc -> /private/etc)
+    return any(_is_inside(path, Path(b)) or _is_inside(path, Path(b).resolve()) for b in blocked)
 
 
 def _is_link_or_junction(path: Path) -> bool:
@@ -90,6 +92,8 @@ def list_excel_files(root: Path) -> ScanListing:
                 keep.append(d)
         dirnames[:] = keep
         for name in sorted(filenames):
+            if name.startswith("._"):
+                continue  # macOS AppleDouble sidecar (not a real workbook); not counted
             ext = os.path.splitext(name)[1].lower()
             if ext in config.LEGACY_EXTENSIONS:
                 listing.skip("unsupported_xls")
@@ -114,7 +118,8 @@ def list_excel_files(root: Path) -> ScanListing:
             if len(listing.files) >= config.MAX_FILES:
                 listing.warnings.append(f"파일이 {config.MAX_FILES}개를 넘어 나머지는 건너뜁니다.")
                 return listing
-            rel = full.relative_to(root).as_posix()
+            # macOS returns decomposed Hangul (NFD); compose it so names match config/regexes
+            rel = unicodedata.normalize("NFC", full.relative_to(root).as_posix())
             listing.files.append(ScannedFile(full, rel, st.st_size, st.st_mtime))
     return listing
 

@@ -1,6 +1,5 @@
 import { useState } from 'react'
-import { DEPT_ORDER } from '../data/mockCatalog'
-import { SORT_MODES } from '../constants'
+import { DEPT_ORDER, SORT_MODES } from '../constants'
 
 // 파일 확장자로 형식 구분 (형식별 정렬용)
 const ext = (name) => (name.match(/\.(\w+)/)?.[1] ?? '기타').toLowerCase()
@@ -12,17 +11,19 @@ function group(files, mode) {
   const key = mode === '부서별' ? (f) => f.dept : (f) => ext(f.name)
   const map = new Map()
   files.forEach((f) => map.set(key(f), [...(map.get(key(f)) ?? []), f]))
-  const order = mode === '부서별' ? DEPT_ORDER : [...map.keys()]
+  const order = mode === '부서별'
+    ? [...DEPT_ORDER, ...[...map.keys()].filter((k) => !DEPT_ORDER.includes(k))]
+    : [...map.keys()]
   return order.filter((k) => map.has(k)).map((k) => [k, map.get(k)])
 }
 
-export default function Sidebar({ catalog, usedFiles }) {
+export default function Sidebar({ catalog, usedFiles, profile, onChangeFolder }) {
   const [mode, setMode] = useState('부서별')
   const pinned = catalog.filter((f) => usedFiles.has(f.name))
   const rest = catalog.filter((f) => !usedFiles.has(f.name))
 
   const row = (f, isPinned) => (
-    <li key={f.name} className={isPinned ? 'file pinned' : 'file'}>
+    <li key={f.path ?? f.name} title={f.path} className={isPinned ? 'file pinned' : 'file'}>
       <span className={`dot ${f.fresh === 'ok' ? 'fresh' : 'stale'}`} />
       <span className="fname">{isPinned && '★ '}{f.name}</span>
     </li>
@@ -62,6 +63,12 @@ export default function Sidebar({ catalog, usedFiles }) {
           </div>
         )}
         {renderGroups(rest, false)}
+      </div>
+
+      <div className="profile">
+        <b>{profile.name} {profile.title}</b>
+        <small>{profile.company} · {profile.dept}</small>
+        <button onClick={onChangeFolder}>폴더 다시 지정</button>
       </div>
     </aside>
   )
