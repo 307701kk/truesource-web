@@ -8,7 +8,7 @@ import AuditView from './components/AuditView'
 import HistoryView from './components/HistoryView'
 import { OpenFileProvider } from './components/OpenFile'
 import GlossaryView from './components/GlossaryView'
-import { getCatalog, getLlmStatus, login } from './api/backend'
+import { getCatalog, getLlmCheck, login } from './api/backend'
 
 // 프로필·폴더 경로는 브라우저에 기억한다 (DB는 백엔드 메모리라 재시작하면 다시 분석해야 함)
 const STORE_KEY = 'truesource.setup'
@@ -29,7 +29,7 @@ export default function App() {
   const [error, setError] = useState(null)
   const [sessionId, setSessionId] = useState(null) // 대화 맥락("그럼 2위는?")을 잇는 세션
   const [view, setView] = useState('ask') // ask | audit
-  const [llmReady, setLlmReady] = useState(true)
+  const [keyProblem, setKeyProblem] = useState(null) // Gemini 키 점검 결과가 나쁠 때의 안내 문구
 
   // 새로고침해도 백엔드가 이미 분석을 끝낸 상태면 시작 화면을 건너뛴다
   useEffect(() => {
@@ -47,7 +47,7 @@ export default function App() {
   }, [saved])
 
   useEffect(() => {
-    getLlmStatus().then((r) => setLlmReady(r.configured)).catch(() => {})
+    checkKey(false)
   }, [])
 
   // 백엔드가 주기적으로 폴더 변경을 반영하므로(추가·수정·삭제), 화면의 카탈로그도 주기적으로 새로고침한다
@@ -60,6 +60,13 @@ export default function App() {
     }, 30000)
     return () => clearInterval(timer)
   }, [setup?.profile.company]) // eslint-disable-line
+
+  // 키가 실제로 쓸 수 있는지 점검한다. 키 오류면 화면 위에 눈에 띄게 알린다.
+  function checkKey(force) {
+    getLlmCheck(force)
+      .then((r) => setKeyProblem(r.ok ? null : r.message))
+      .catch(() => {})
+  }
 
   function handleSetupDone(profile, path, catalog) {
     save({ profile, path })
@@ -77,6 +84,7 @@ export default function App() {
       setResult(res)
     } catch (e) {
       setError(e.message || '알 수 없는 오류')
+      if (e.message?.startsWith('API 키 오류')) checkKey(true)
     } finally {
       setLoading(false)
     }
@@ -109,9 +117,10 @@ export default function App() {
         onNav={setView}
       />
       <main className="main">
-        {!llmReady && (
-          <div className="notice">
-            GEMINI_API_KEY 가 설정되지 않았습니다. backend/.env 에 키를 넣고 백엔드를 다시 시작하세요.
+        {keyProblem && (
+          <div className="notice key-error" role="alert">
+            <b>⚠ {keyProblem.startsWith('API 키 오류') ? '' : 'AI 연결 문제: '}{keyProblem}</b>
+            <button onClick={() => checkKey(true)}>다시 확인</button>
           </div>
         )}
         {view === 'audit' && <div className="content"><AuditView /></div>}

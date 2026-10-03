@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -268,7 +269,12 @@ class Agent:
 
     def _loop(self, sess: Session, tools: ToolBox, ctx: QuestionCtx, turn: list, qid: str) -> None:
         nudges = 0
+        started = time.monotonic()
         for _ in range(config.MAX_TOOL_CALLS + config.MAX_NUDGES + config.MAX_NUMBER_RETRIES + 4):
+            if time.monotonic() - started > config.QUESTION_TIMEOUT_SECONDS:
+                raise GatewayError(
+                    f"응답이 {config.QUESTION_TIMEOUT_SECONDS}초를 넘어 중단했습니다. Gemini 호출이 느리거나 한도에 걸렸을 수 있습니다. 잠시 후 다시 질문하세요."
+                )
             only_final = ctx.calls >= config.MAX_TOOL_CALLS
             if only_final:
                 ctx.budget_hit = True  # the investigation was cut short by the call limit

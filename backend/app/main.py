@@ -14,7 +14,7 @@ from pydantic import BaseModel
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")  # backend/.env (GEMINI_API_KEY ...)
 
 from . import config  # noqa: E402
-from .agent.gateway import Gateway, GatewayError, LLMNotConfigured  # noqa: E402
+from .agent.gateway import ApiKeyError, Gateway, GatewayError, LLMNotConfigured  # noqa: E402
 from .agent.runner import Agent  # noqa: E402
 from .companydb import CompanyManager  # noqa: E402
 from .opener import OpenError, open_file  # noqa: E402
@@ -119,6 +119,12 @@ def llm_status() -> dict:
     return {"configured": gateway.configured(), "model": config.gemini_model()}
 
 
+@app.get("/api/llm/check")
+def llm_check(force: bool = False) -> dict:
+    """Is the Gemini key usable? One tiny call, cached 5 min: {ok, kind, message}."""
+    return gateway.check(force=force)
+
+
 @app.post("/api/query")
 def query(req: QueryRequest) -> dict:
     """Ask a question: the agent plans, calls local tools and answers (see README)."""
@@ -134,7 +140,7 @@ def query(req: QueryRequest) -> dict:
         out = agent.ask(question, req.user, req.session_id, db.glossary_list())
         out["history_id"] = db.add_question(req.user.get("name", ""), out.get("session_id"), out)
         return out
-    except LLMNotConfigured as exc:
+    except (LLMNotConfigured, ApiKeyError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GatewayError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

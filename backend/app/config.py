@@ -51,6 +51,9 @@ GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
 MAX_TOOL_CALLS = 10  # tool calls per question (final_answer / ask_user are not counted)
 MAX_QUERY_RETRIES = 2  # failed run_query attempts allowed per question
 MAX_NUDGES = 3  # times the model may answer in plain text instead of calling a tool
+QUESTION_TIMEOUT_SECONDS = (
+    120  # one question may take at most this long (then it stops with a message)
+)
 MAX_NUMBER_RETRIES = 2  # rewrites allowed when a number in the answer does not match
 CROSS_TOLERANCE = 0.01  # cross-check: relative difference regarded as "same"
 MAX_GROUP_ROWS = 30  # a query may return at most this many aggregate rows to the LLM

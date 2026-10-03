@@ -32,7 +32,11 @@ npm run dev                 # http://127.0.0.1:5173
 
 설정(`backend/.env`): `GEMINI_API_KEY`, `GEMINI_MODEL`(기본 `gemini-3.8-flash`), 선택으로
 `TRUESOURCE_DATA_DIR`(회사 DB 위치, 기본 `backend/data`), `TRUESOURCE_SYNC_SECONDS`(주기 스캔 간격, 기본 600초, 0이면 끔).
-Gemini 무료 한도에서는 분당 호출 제한(429)에 걸릴 수 있어, 서버가 알려주는 대기 시간만큼 기다렸다가 자동 재시도합니다(질문 하나에 LLM 호출이 여러 번).
+Gemini 무료 한도에서는 호출 제한(429)에 걸릴 수 있어, 서버가 알려주는 대기 시간(최대 20초)만큼 기다렸다가 최대 3번까지 재시도합니다. 질문 하나는 최대 120초에서 멈추고 이유를 알려 줍니다.
+
+**키 오류 안내**: 앱을 열 때 키를 한 번 점검(`GET /api/llm/check`, 작은 테스트 호출 1회, 5분 캐시)하고, 키가 없거나 잘못됐거나 차단됐으면 화면 맨 위에
+"**API 키 오류**: … backend/.env 의 GEMINI_API_KEY 를 확인(새 키 발급)한 뒤 백엔드를 다시 시작하세요"와 "다시 확인" 버튼을 보여 줍니다.
+키 오류(401·403·'API key not valid')는 재시도 없이 **즉시** 알립니다. 모델명 오류(404)·한도 초과(429)·서버 혼잡(503)은 각각 다른 문구로 구분합니다.
 
 ## 구조
 
@@ -259,6 +263,7 @@ backend/app/
 | GET | `/api/scan/log` | 회사별 동기화 로그 (추가·수정·삭제·이동) |
 | GET | `/api/audit` | 외부 LLM으로 나간 내용(마스킹 후) |
 | GET | `/api/llm/status` | 키 설정 여부, 사용 모델 |
+| GET | `/api/llm/check` | 키가 실제로 쓸 수 있는지 점검 `{ok, kind, message}` |
 | POST | `/api/open` | 근거 파일을 이 PC의 엑셀로 열기 `{"path": 카탈로그 상대경로}` |
 
 `/api/query` 응답: `type`(질문형·검증형·찾기형·되묻기·내용없음), `answer`, `confidence`, `confidence_reason`,
@@ -270,7 +275,7 @@ backend/app/
 
 ```bash
 cd backend && pip install -r requirements-dev.txt
-TRUESOURCE_DATASET=<가온산업_가상데이터 경로> pytest -q     # 143개 (데이터셋 없으면 일부 건너뜀)
+TRUESOURCE_DATASET=<가온산업_가상데이터 경로> pytest -q     # 151개 (데이터셋 없으면 일부 건너뜀)
 ruff check . && ruff format --check .
 ```
 
