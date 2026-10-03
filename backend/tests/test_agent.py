@@ -486,3 +486,24 @@ def test_question_stops_with_a_message_when_it_takes_too_long(monkeypatch, tmp_p
     with pytest.raises(GatewayError, match="초를 넘어 중단"):
         Agent(svc, gw).ask("질문", {"name": "홍", "company": "c"})
     assert isinstance(svc, ScanService)
+
+
+def test_unmask_also_restores_placeholders_written_without_braces():
+    m = Masker()
+    m.fwd, m.rev = (
+        {"대성기계": "{거래처12}", "영업2팀": "{팀3}"},
+        {"{거래처12}": "대성기계", "{팀3}": "영업2팀"},
+    )
+    assert m.unmask("{거래처12} 자료") == "대성기계 자료"
+    assert (
+        m.unmask("거래처12 자료를 찾아줘") == "대성기계 자료를 찾아줘"
+    )  # the model dropped the braces
+    assert m.unmask("팀3의 실적") == "영업2팀의 실적"
+    assert (
+        m.unmask("거래처99와 영업3팀") == "거래처99와 영업3팀"
+    )  # unknown numbers / real names stay untouched
+    assert m.unmask("코드팀3월") == "코드팀3월"  # not a standalone placeholder
+    args = {"text": "거래처12", "filters": [{"value": "팀3"}]}
+    from app.agent.gateway import map_strings
+
+    assert map_strings(args, m.unmask) == {"text": "대성기계", "filters": [{"value": "영업2팀"}]}

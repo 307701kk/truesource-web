@@ -221,3 +221,9 @@ ul.plain { margin: 0; padding-left: 18px; line-height: 1.7; font-size: 13.5px; }
 .loading3d.compact .scene-box { width: 220px; height: 190px; }
 .loading3d.compact .scene-box > .scene { transform: scale(1.45); }
 .loading3d.compact .loading-text { font-size: 16px; }
+
+.render-error { margin: 24px auto; max-width: 560px; border-color: #f3b9b9; display: flex; flex-direction: column; gap: 10px; }
+.render-error h3 { margin: 0; color: var(--low); font-size: 16px; }
+.render-error .fallback-answer { background: #F5F6F8; border-radius: 8px; padding: 10px 12px; }
+.render-error small { color: #7a8599; word-break: break-all; }
+.render-error button { align-self: flex-start; background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 14px; }

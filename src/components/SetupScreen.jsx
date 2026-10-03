@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { getCatalog, getScanStatus, login, startScan } from '../api/backend'
 import { DEPT_ORDER } from '../constants'
-import Loading3D from './Loading3D'
 
 const POLL_MS = 500
 
@@ -140,13 +139,6 @@ function FolderForm({ profile, initialPath, onBack, onDone }) {
         autoFocus
       />
       {error && <div className="state error">{error}</div>}
-      {running && (
-        <Loading3D
-          compact
-          text="폴더를 분석하는 중입니다…"
-          detail={`엑셀 파일을 읽고 있습니다 (${status.files_done}/${status.files_total})`}
-        />
-      )}
       {status && <Progress status={status} />}
       <div className="row">
         <button type="button" className="ghost" onClick={onBack} disabled={running}>이전</button>

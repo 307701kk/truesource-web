@@ -168,7 +168,18 @@ class Masker:
         for ph, real in self.rev.items():
             if ph in text:
                 text = text.replace(ph, real)
+        # Some models drop the braces ("거래처12" instead of "{거래처12}"); restore those too.
+        # Only exact placeholders we handed out are touched, and only in what the LLM wrote.
+        if self.rev:
+            text = _BARE_PLACEHOLDER.sub(
+                lambda m: self.rev.get("{" + m.group(0) + "}", m.group(0)), text
+            )
         return text
+
+
+_BARE_PLACEHOLDER = re.compile(
+    r"(?<![0-9A-Za-z가-힣{])(?:거래처|담당자|팀|사업자번호|전화|이메일)\d+(?![0-9}])"
+)
 
 
 def map_strings(obj, fn):
