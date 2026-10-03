@@ -180,3 +180,6 @@ button { font: inherit; cursor: pointer; }
 ul.plain { margin: 0; padding-left: 18px; line-height: 1.7; font-size: 13.5px; }
 .file .lock { margin-left: auto; color: #e7b93c; font-size: 12px; }
 .file { cursor: pointer; } .file:hover { background: rgba(255,255,255,.1); }
+
+.notice.key-error { background: #FDECEC; color: #8a1f1f; border-bottom: 1px solid #f3b9b9; display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+.notice.key-error button { background: #8a1f1f; color: #fff; border: 0; border-radius: 6px; padding: 5px 12px; font-size: 12.5px; flex: none; }

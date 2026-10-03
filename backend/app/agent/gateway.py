@@ -57,7 +57,9 @@ _INJECTION = re.compile(
 FORBIDDEN_KEYS = {"raw_rows", "raw", "cells", "records"}
 MAX_LIST_ITEMS = 60
 MAX_PAYLOAD_CHARS = 120_000
-MAX_ATTEMPTS = 4  # per LLM call (429 / 5xx are retried)
+CHECK_TTL = 300  # seconds a key check result is reused
+MAX_ATTEMPTS = 3  # per LLM call (429 / 5xx are retried; key errors never)
+MAX_RETRY_WAIT = 20  # seconds: never make a person wait longer than this for one retry
 
 
 class GatewayError(RuntimeError):
@@ -66,6 +68,43 @@ class GatewayError(RuntimeError):
 
 class LLMNotConfigured(GatewayError):
     pass
+
+
+class ApiKeyError(GatewayError):
+    """The API key is missing, wrong, expired or blocked. Shown to the user as "API 키 오류"."""
+
+
+KEY_HINT = "backend/.env 의 GEMINI_API_KEY 를 확인(새 키 발급)한 뒤 백엔드를 다시 시작하세요."
+
+
+def _not_set() -> LLMNotConfigured:
+    return LLMNotConfigured(
+        "API 키 오류: GEMINI_API_KEY 가 설정되지 않았습니다. backend/.env 에 키를 넣고 백엔드를 다시 시작하세요."
+    )
+
+
+def classify_api_error(exc: Exception) -> GatewayError:
+    """Turn a Gemini API error into a message people understand (key / model / quota / other)."""
+    code = getattr(exc, "code", None)
+    text = str(getattr(exc, "message", "") or exc)
+    short = text.replace("\n", " ")[:140]
+    if code in (401, 403) or (
+        code == 400 and re.search(r"api[ _]?key|API_KEY_INVALID", text, re.I)
+    ):
+        return ApiKeyError(
+            f"API 키 오류: 키가 잘못됐거나 만료·차단됐습니다. {KEY_HINT} (구글 응답 {code}: {short})"
+        )
+    if code == 404:
+        return GatewayError(
+            f"모델 오류: '{config.gemini_model()}' 모델을 쓸 수 없습니다. GEMINI_MODEL 을 확인하세요. ({short})"
+        )
+    if code == 429:
+        return GatewayError(
+            "요청 한도 초과: Gemini 호출 한도(분당 또는 일일)를 넘었습니다. 잠시 후 다시 질문하거나 API 요금제·한도를 확인하세요."
+        )
+    if code in (500, 503):
+        return GatewayError("Gemini 서버가 혼잡합니다. 잠시 후 다시 시도하세요.")
+    return GatewayError(f"Gemini API 오류({code}): {short}")
 
 
 class Masker:
@@ -202,6 +241,7 @@ class Gateway:
     def __init__(self, audit: AuditLog | None = None) -> None:
         self.audit = audit or AuditLog()
         self._client: genai.Client | None = None
+        self._check: dict | None = None
 
     def configured(self) -> bool:
         return bool(config.gemini_api_key())
@@ -209,9 +249,7 @@ class Gateway:
     def _get_client(self) -> genai.Client:
         key = config.gemini_api_key()
         if not key:
-            raise LLMNotConfigured(
-                "GEMINI_API_KEY 가 설정되지 않았습니다. backend/.env 에 키를 넣고 서버를 다시 시작하세요."
-            )
+            raise _not_set()
         if self._client is None:
             self._client = genai.Client(api_key=key)
         return self._client
@@ -282,7 +320,7 @@ class Gateway:
         code = getattr(exc, "code", None)
         if code == 429:
             m = re.search(r"retry(?:Delay|[ _]in)\D{0,12}([\d.]+)\s*s", str(exc), re.IGNORECASE)
-            return min(float(m.group(1)) + 1, 65) if m else 20.0
+            return min(float(m.group(1)) + 1, MAX_RETRY_WAIT) if m else 10.0
         return 2.0 * (attempt + 1)
 
     def _generate(self, client, contents, cfg):
@@ -295,17 +333,38 @@ class Gateway:
             except genai_errors.APIError as exc:
                 last = exc
                 code = getattr(exc, "code", None)
-                detail = str(getattr(exc, "message", "") or "")[:160]
                 if code in (429, 500, 503) and attempt < MAX_ATTEMPTS - 1:
                     time.sleep(self._retry_wait(exc, attempt))
                     continue
-                if code in (400, 401, 403):
-                    raise GatewayError(
-                        f"Gemini API 오류({code}): {detail} (API 키·프로젝트·모델명을 확인하세요)"
-                    ) from exc
-                if code == 429:
-                    raise GatewayError(
-                        "Gemini 요청 한도(분당 또는 일일 호출 수)를 넘었습니다. 잠시 후 다시 질문하거나 API 요금제·한도를 확인하세요."
-                    ) from exc
-                raise GatewayError(f"Gemini API 오류({code}): {detail}") from exc
+                raise classify_api_error(exc) from exc  # key / model / quota errors stop at once
         raise GatewayError("Gemini API 호출에 실패했습니다.") from last
+
+    # ---------------------------------------------------------------- key check
+    def check(self, *, force: bool = False) -> dict:
+        """Tiny test call: is the key (and model) usable? Cached for a few minutes."""
+        now = time.time()
+        if not force and self._check and now - self._check["at"] < CHECK_TTL:
+            return self._check["result"]
+        if not self.configured():
+            result = {"ok": False, "kind": "api_key", "message": str(_not_set())}
+        else:
+            try:
+                client = self._get_client()
+                client.models.generate_content(
+                    model=config.gemini_model(),
+                    contents="ping",
+                    config=types.GenerateContentConfig(max_output_tokens=8),
+                )
+                result = {"ok": True, "kind": None, "message": None}
+            except genai_errors.APIError as exc:
+                err = classify_api_error(exc)
+                kind = "api_key" if isinstance(err, ApiKeyError) else "other"
+                # a busy server / quota limit means the key itself works
+                ok = getattr(exc, "code", None) in (429, 500, 503)
+                result = {
+                    "ok": ok,
+                    "kind": None if ok else kind,
+                    "message": None if ok else str(err),
+                }
+        self._check = {"at": now, "result": result}
+        return result

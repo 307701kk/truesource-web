@@ -370,3 +370,119 @@ def test_query_before_scan_is_refused(monkeypatch):
     monkeypatch.setattr(main, "service", ScanService())
     res = client.post("/api/query", json={"question": "안녕", "user": USER})
     assert res.status_code == 409 and "분석" in res.json()["detail"]
+
+
+# ---------------------------------------------------------------- API key / quota errors
+def _api_error(code: int, message: str):
+    from google.genai import errors as genai_errors
+
+    return genai_errors.APIError(
+        code, {"error": {"code": code, "message": message, "status": "X"}}, None
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        (403, "Your project has been denied access. Please contact support."),
+        (401, "Request had invalid authentication credentials."),
+        (400, "API key not valid. Please pass a valid API key."),
+    ],
+)
+def test_key_problems_are_reported_as_api_key_errors(code, message):
+    from app.agent.gateway import ApiKeyError, classify_api_error
+
+    err = classify_api_error(_api_error(code, message))
+    assert isinstance(err, ApiKeyError) and str(err).startswith("API 키 오류")
+    assert "GEMINI_API_KEY" in str(err)
+
+
+def test_other_errors_are_not_called_key_errors():
+    from app.agent.gateway import ApiKeyError, classify_api_error
+
+    quota = classify_api_error(_api_error(429, "quota"))
+    assert not isinstance(quota, ApiKeyError) and "한도" in str(quota)
+    assert "모델" in str(classify_api_error(_api_error(404, "model gone")))
+
+
+def test_key_error_fails_fast_without_retry(monkeypatch):
+    from app.agent.gateway import ApiKeyError, Gateway
+
+    calls = []
+
+    class Client:
+        class models:  # noqa: N801
+            @staticmethod
+            def generate_content(**kw):
+                calls.append(1)
+                raise _api_error(403, "denied")
+
+    monkeypatch.setattr("time.sleep", lambda s: calls.append("slept"))
+    with pytest.raises(ApiKeyError):
+        Gateway()._generate(Client, [], None)
+    assert calls == [1]  # one call, no waiting
+
+
+def test_rate_limit_retries_are_short(monkeypatch):
+    from app.agent.gateway import MAX_RETRY_WAIT, Gateway
+
+    waits = []
+    monkeypatch.setattr("time.sleep", waits.append)
+
+    class Client:
+        class models:  # noqa: N801
+            @staticmethod
+            def generate_content(**kw):
+                raise _api_error(429, "retry in 120s")
+
+    with pytest.raises(GatewayError):
+        Gateway()._generate(Client, [], None)
+    assert waits and max(waits) <= MAX_RETRY_WAIT
+
+
+def test_check_endpoint_reports_missing_and_bad_keys(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app import main
+    from app.agent.gateway import Gateway
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    gw = Gateway()
+    monkeypatch.setattr(main, "gateway", gw)
+    client = TestClient(main.app)
+    res = client.get("/api/llm/check", params={"force": True}).json()
+    assert (
+        res["ok"] is False and res["kind"] == "api_key" and res["message"].startswith("API 키 오류")
+    )
+
+    monkeypatch.setenv("GEMINI_API_KEY", "bad-key")
+
+    class Client:
+        class models:  # noqa: N801
+            @staticmethod
+            def generate_content(**kw):
+                raise _api_error(403, "denied")
+
+    gw._client = Client
+    res = client.get("/api/llm/check", params={"force": True}).json()
+    assert res["ok"] is False and res["kind"] == "api_key"
+    gw._client = type(
+        "C", (), {"models": type("M", (), {"generate_content": staticmethod(lambda **kw: None)})}
+    )
+    assert client.get("/api/llm/check", params={"force": True}).json()["ok"] is True
+
+
+def test_question_stops_with_a_message_when_it_takes_too_long(monkeypatch, tmp_path):
+    from app.agent import runner
+    from app.agent.runner import Agent
+    from app.service import ScanService
+    from tests.test_rules import make, month_rows, perf, scan
+
+    root = tmp_path / "s"
+    make(root, "영업팀/실적.xlsx", {"팀별실적": perf(month_rows())})
+    svc = scan(root)
+    monkeypatch.setattr(runner.config, "QUESTION_TIMEOUT_SECONDS", -1)
+    gw = ScriptedGateway(lambda step, r, c: [("lookup_terms", {"terms": ["실적"]})])
+    with pytest.raises(GatewayError, match="초를 넘어 중단"):
+        Agent(svc, gw).ask("질문", {"name": "홍", "company": "c"})
+    assert isinstance(svc, ScanService)
