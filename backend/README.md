@@ -1,7 +1,9 @@
-# TrueSource Backend (데이터 계층)
+# TrueSource Backend
+
+> 에이전트(질문 처리) 동작 방식은 [루트 README](../README.md#에이전트가-굴러가는-방식) 참고. 아래는 데이터 계층 설명이며, `.env`(`GEMINI_API_KEY`)는 `.env.example`을 복사해 만든다.
 
 공유폴더 경로를 받아 엑셀(xlsx/xlsm)을 스캔 → 시트별 표로 변환 → 인메모리 DuckDB에 저장.
-질문 처리(에이전트/LLM)는 아직 없음. 원본 엑셀은 읽기 전용으로만 열고 수정하지 않음.
+원본 엑셀은 읽기 전용으로만 열고 수정하지 않음.
 
 ## 실행 (Windows)
 ```
@@ -22,6 +24,9 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 | GET | /api/scan/status | state(idle/running/done/error), 진행률, 건너뛴 파일 |
 | GET | /api/catalog | 파일 목록(id, name, path, dept, modified, sheets, rows, fresh[ok/stale/copy], copy_of, data_date, error) + departments |
 | GET | /api/catalog/{id} | 파일 상세(시트/컬럼) |
+| POST | /api/query | 질문 → 에이전트 응답 (`agent/`) |
+| GET | /api/audit | 외부 LLM으로 나간 내용(마스킹 후) |
+| GET | /api/llm/status | Gemini 키 설정 여부·모델 |
 
 ## 테이블 구조
 - 시트마다 `t_0001..` 테이블. 컬럼: 원본 헤더 + `_row`(엑셀 원본 행 번호), `_row_kind`('data'|'subtotal'|'total'), `_label`

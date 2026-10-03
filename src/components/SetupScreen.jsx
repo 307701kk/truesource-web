@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { getCatalog, getScanStatus, startScan } from '../api/backend'
+import { getCatalog, getScanStatus, login, startScan } from '../api/backend'
 import { DEPT_ORDER } from '../constants'
 
 const POLL_MS = 500
@@ -8,9 +8,17 @@ const POLL_MS = 500
 export default function SetupScreen({ initialProfile, initialPath, onDone }) {
   const [profile, setProfile] = useState(initialProfile)
   const [step, setStep] = useState(initialProfile ? 'folder' : 'profile')
+  const [path, setPath] = useState(initialPath)
 
-  function saveProfile(p) {
+  // 회사 DB를 열고(없으면 만들고) 사용자를 등록한다. 이 회사 폴더가 이미 분석돼 있으면 바로 입장.
+  async function saveProfile(p) {
+    const res = await login(p)
     setProfile(p)
+    if (res.last_folder) setPath(res.last_folder)
+    if (res.loaded) {
+      const catalog = await getCatalog()
+      return onDone(p, catalog.scanned_path, catalog)
+    }
     setStep('folder')
   }
 
@@ -23,7 +31,7 @@ export default function SetupScreen({ initialProfile, initialPath, onDone }) {
         ) : (
           <FolderForm
             profile={profile}
-            initialPath={initialPath}
+            initialPath={path}
             onBack={() => setStep('profile')}
             onDone={(path, catalog) => onDone(profile, path, catalog)}
           />
@@ -39,12 +47,23 @@ function ProfileForm({ initial, onSubmit }) {
   )
   const set = (key) => (e) => setForm({ ...form, [key]: e.target.value })
   const ready = Object.values(form).every((v) => v.trim())
+  const [error, setError] = useState(null)
+  const [busy, setBusy] = useState(false)
 
   return (
     <form
-      onSubmit={(e) => {
+      onSubmit={async (e) => {
         e.preventDefault()
-        if (ready) onSubmit(Object.fromEntries(Object.entries(form).map(([k, v]) => [k, v.trim()])))
+        if (!ready || busy) return
+        setBusy(true)
+        setError(null)
+        try {
+          await onSubmit(Object.fromEntries(Object.entries(form).map(([k, v]) => [k, v.trim()])))
+        } catch (err) {
+          setError(err.message)
+        } finally {
+          setBusy(false)
+        }
       }}
     >
       <h2>사용자 정보를 입력하세요</h2>
@@ -58,7 +77,8 @@ function ProfileForm({ initial, onSubmit }) {
         </datalist>
       </label>
       <label>직책<input value={form.title} onChange={set('title')} placeholder="대리" /></label>
-      <button type="submit" disabled={!ready}>다음</button>
+      {error && <div className="state error">{error}</div>}
+      <button type="submit" disabled={!ready || busy}>{busy ? '확인 중…' : '다음'}</button>
     </form>
   )
 }
@@ -92,7 +112,7 @@ function FolderForm({ profile, initialPath, onBack, onDone }) {
     if (!path.trim() || running) return
     setError(null)
     try {
-      setStatus(await startScan(path.trim()))
+      setStatus(await startScan(path.trim(), profile.company))
       poll()
     } catch (err) {
       if (err.status === 409) { // 이미 스캔 중이면 그 진행을 이어서 보여 준다

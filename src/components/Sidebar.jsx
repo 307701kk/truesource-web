@@ -17,7 +17,7 @@ function group(files, mode) {
   return order.filter((k) => map.has(k)).map((k) => [k, map.get(k)])
 }
 
-export default function Sidebar({ catalog, usedFiles, profile, onChangeFolder }) {
+export default function Sidebar({ catalog, sync, usedFiles, profile, onChangeFolder, view, onNav }) {
   const [mode, setMode] = useState('부서별')
   const pinned = catalog.filter((f) => usedFiles.has(f.name))
   const rest = catalog.filter((f) => !usedFiles.has(f.name))
@@ -42,13 +42,19 @@ export default function Sidebar({ catalog, usedFiles, profile, onChangeFolder })
     <aside className="sidebar">
       <div className="brand">트루소스<small>TrueSource</small></div>
       <nav className="nav">
-        <button className="active">질문하기</button>
-        <button>최근 질문</button>
-        <button>감사 로그</button>
-        <button>용어사전</button>
+        <button className={view === 'ask' ? 'active' : ''} onClick={() => onNav('ask')}>질문하기</button>
+        <button className={view === 'history' ? 'active' : ''} onClick={() => onNav('history')}>최근 질문</button>
+        <button className={view === 'audit' ? 'active' : ''} onClick={() => onNav('audit')}>감사 로그</button>
+        <button className={view === 'glossary' ? 'active' : ''} onClick={() => onNav('glossary')}>용어사전</button>
       </nav>
 
       <div className="catalog-head">카탈로그 · {catalog.length}개 파일</div>
+      {sync && (
+        <div className="sync" title="마지막 폴더 동기화 결과">
+          동기화 · 추가 {sync.added} · 수정 {sync.modified} · 삭제 {sync.deleted}
+          {sync.moved > 0 && ` · 이동 ${sync.moved}`}
+        </div>
+      )}
       <div className="tabs">
         {SORT_MODES.map((m) => (
           <button key={m} className={m === mode ? 'on' : ''} onClick={() => setMode(m)}>{m}</button>

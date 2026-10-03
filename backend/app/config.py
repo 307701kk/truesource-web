@@ -44,3 +44,38 @@ def allowed_roots() -> list[Path]:
 def cors_origins() -> list[str]:
     raw = os.environ.get("TRUESOURCE_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
     return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+# ---- agent (LLM) ----
+GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
+MAX_TOOL_CALLS = 10  # tool calls per question (final_answer / ask_user are not counted)
+MAX_QUERY_RETRIES = 2  # failed run_query attempts allowed per question
+MAX_NUDGES = 3  # times the model may answer in plain text instead of calling a tool
+MAX_NUMBER_RETRIES = 2  # rewrites allowed when a number in the answer does not match
+CROSS_TOLERANCE = 0.01  # cross-check: relative difference regarded as "same"
+MAX_GROUP_ROWS = 30  # a query may return at most this many aggregate rows to the LLM
+MAX_HISTORY_TURNS = 6  # earlier questions kept in a session (compact form)
+AUDIT_MAX_ENTRIES = 500
+
+
+def gemini_api_key() -> str:
+    return os.environ.get("GEMINI_API_KEY", "").strip()
+
+
+def gemini_model() -> str:
+    return os.environ.get("GEMINI_MODEL", "").strip() or GEMINI_DEFAULT_MODEL
+
+
+# ---- per-company storage ----
+def data_dir() -> Path:
+    """Where company databases live (one SQLite file per company). Local only, never committed."""
+    raw = os.environ.get("TRUESOURCE_DATA_DIR", "").strip()
+    return Path(raw) if raw else Path(__file__).resolve().parent.parent / "data"
+
+
+def sync_interval_seconds() -> int:
+    """Periodic folder re-check (design: every ~10 min). 0 turns it off."""
+    try:
+        return int(os.environ.get("TRUESOURCE_SYNC_SECONDS", "600"))
+    except ValueError:
+        return 600

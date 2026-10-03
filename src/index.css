@@ -117,3 +117,39 @@ button { font: inherit; cursor: pointer; }
 .profile { border-top: 1px solid rgba(255,255,255,.12); padding-top: 10px; margin-top: 8px; display: flex; flex-direction: column; gap: 2px; font-size: 13px; color: #fff; }
 .profile small { color: #9fb0d0; font-size: 11.5px; }
 .profile button { margin-top: 6px; background: rgba(255,255,255,.1); border: 0; color: #c5d0e6; border-radius: 4px; padding: 5px; font-size: 12px; }
+
+/* 에이전트 화면 */
+.notice { background: #FFF4D6; color: #7a5600; padding: 10px 28px; font-size: 13px; border-bottom: 1px solid #f0dca0; }
+.signals { list-style: none; margin: 12px 0 0; padding: 10px 0 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }
+.signals li { display: flex; align-items: center; gap: 6px; }
+.signals .dot.low { background: var(--low); } .signals .dot.mid { background: var(--mid); } .signals .dot.high { background: var(--high); }
+.ask-q { font-size: 15px; margin: 0 0 12px; }
+.ask-hint { color: #7a8599; font-size: 12.5px; margin: 12px 0 0; }
+.nav button:disabled { opacity: .4; cursor: default; }
+.audit h2 { font-size: 17px; margin: 0 0 12px; } .audit h2 small { color: #7a8599; font-weight: 400; font-size: 12.5px; margin-left: 8px; }
+.audit-item { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; font-size: 13px; }
+.audit-item summary { cursor: pointer; }
+.audit-item pre { white-space: pre-wrap; word-break: break-all; background: #F5F6F8; padding: 10px; border-radius: 6px; font-size: 12px; max-height: 360px; overflow: auto; }
+.pill { background: #EEF2F8; color: #36507f; border-radius: 999px; padding: 2px 8px; margin-left: 8px; font-size: 11.5px; }
+.pill.warn { background: #FDE8E8; color: var(--low); }
+
+/* 최근 질문 · 용어사전 · 동기화 */
+.sync { font-size: 11.5px; color: #9fb0d0; margin: -2px 0 8px; }
+.history h2, .glossary h2 { font-size: 17px; margin: 0 0 12px; display: flex; align-items: baseline; gap: 12px; }
+.history h2 .check { font-size: 12.5px; font-weight: 400; color: #5b6578; }
+.history h2 .check input { margin-right: 4px; }
+.glossary h2 small { color: #7a8599; font-weight: 400; font-size: 12.5px; }
+.history-item { display: flex; gap: 6px; margin-bottom: 8px; }
+.history-item .open { flex: 1; text-align: left; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.history-item .open:hover { border-color: var(--accent); }
+.history-item .q { font-weight: 600; }
+.history-item .meta { font-size: 12px; color: #7a8599; }
+.history-item .a { font-size: 13px; color: #44506a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-item .del, .gl-form + .state + .tbl .del, .glossary .del { background: none; border: 0; color: #9aa4b8; padding: 0 8px; }
+.history-item .del:hover, .glossary .del:hover { color: var(--low); }
+.pill.c-low { background: #FDE8E8; color: var(--low); } .pill.c-mid { background: #FFF4D6; color: #7a5600; } .pill.c-high { background: #E3F5EA; color: #1d7a45; }
+.gl-form { display: grid; grid-template-columns: 1fr 1.3fr 1.6fr 1.3fr auto; gap: 8px; margin-bottom: 12px; }
+.gl-form input { padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; min-width: 0; }
+.gl-form button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 0 18px; }
+.gl-form button:disabled { background: #a9b8d6; }
+.gl-hint { font-size: 12.5px; color: #7a8599; }
