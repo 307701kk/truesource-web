@@ -82,3 +82,19 @@ def sync_interval_seconds() -> int:
         return int(os.environ.get("TRUESOURCE_SYNC_SECONDS", "600"))
     except ValueError:
         return 600
+
+
+# ---- concurrent questions (one server per company, several people asking at the same time) ----
+def max_concurrent_questions() -> int:
+    """How many questions are processed at once. Every question makes ~5-12 Gemini calls, so letting
+    everybody run at once only makes them hit the rate limit together; the rest wait in line."""
+    try:
+        return max(1, int(os.environ.get("TRUESOURCE_MAX_CONCURRENT", "4")))
+    except ValueError:
+        return 4
+
+
+# Request threads. Every waiting question holds one, so the default (40) would be used up by a queue
+# of questions and freeze logins / catalog calls. Raised so people who only look around stay fast.
+REQUEST_THREADS = 256
+QUEUE_WAIT_SECONDS = 120  # a question waits at most this long for a free slot

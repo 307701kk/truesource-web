@@ -8,6 +8,7 @@ import AuditView from './components/AuditView'
 import HistoryView from './components/HistoryView'
 import { OpenFileProvider } from './components/OpenFile'
 import Loading3D from './components/Loading3D'
+import QueueNotice from './components/QueueNotice'
 import ErrorBoundary from './components/ErrorBoundary'
 import GlossaryView from './components/GlossaryView'
 import SyncNotice from './components/SyncNotice'
@@ -193,7 +194,12 @@ export default function App() {
         {view === 'ask' && (<>
         <QuestionBar onAsk={handleAsk} loading={loading} />
         <div className="content">
-          {loading && <Loading3D />}
+          {loading && (
+            <>
+              <Loading3D />
+              <QueueNotice />
+            </>
+          )}
           {error && <div className="state error">오류: {error}</div>}
           {!loading && !error && !result && (
             <div className="state">질문을 입력하거나 아래 예시를 눌러보세요.</div>

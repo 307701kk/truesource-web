@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +18,8 @@ from . import config  # noqa: E402
 from .agent import scope  # noqa: E402
 from .agent.gateway import ApiKeyError, Gateway, GatewayError, LLMNotConfigured  # noqa: E402
 from .agent.runner import Agent  # noqa: E402
-from .companydb import CompanyManager  # noqa: E402
+from .companydb import CompanyManager, normalize_name  # noqa: E402
+from .limiter import QuestionLimiter, QueueTimeout  # noqa: E402
 from .opener import OpenError, open_file  # noqa: E402
 from .service import ScanBusyError, ScanPathError, ScanService  # noqa: E402
 
@@ -32,6 +34,8 @@ async def _auto_sync_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # waiting questions each hold a request thread: make room, so light requests are never starved
+    anyio.to_thread.current_default_thread_limiter().total_tokens = config.REQUEST_THREADS
     task = asyncio.create_task(_auto_sync_loop())
     yield
     task.cancel()
@@ -48,6 +52,7 @@ service = ScanService()
 companies = CompanyManager(config.data_dir())
 gateway = Gateway()
 agent = Agent(service, gateway)
+limiter = QuestionLimiter(config.max_concurrent_questions())
 
 
 def _record_scan(
@@ -73,7 +78,7 @@ class ScanRequest(BaseModel):
 
 
 @app.get("/api/health")
-def health() -> dict:
+async def health() -> dict:  # runs on the event loop: answers even if every worker thread is busy
     return {"ok": True}
 
 
@@ -127,6 +132,12 @@ def llm_check(force: bool = False) -> dict:
     return gateway.check(force=force)
 
 
+@app.get("/api/queue")
+async def queue_status() -> dict:
+    """How many questions are being processed / waiting right now (shown while a question waits)."""
+    return limiter.status()
+
+
 @app.post("/api/query")
 def query(req: QueryRequest) -> dict:
     """Ask a question: the agent plans, calls local tools and answers (see README)."""
@@ -138,6 +149,13 @@ def query(req: QueryRequest) -> dict:
     if service.store is None:
         raise HTTPException(status_code=409, detail="먼저 공유폴더를 분석하세요.")
     db = _company(req.user.get("company"))
+    loaded = service.scan_company
+    if loaded and normalize_name(loaded) != db.name:  # one server = one company: never mix data
+        raise HTTPException(
+            status_code=409,
+            detail=f"이 서버에는 다른 회사('{loaded}')의 폴더가 분석돼 있습니다. "
+            "이 서버를 쓰는 회사의 이름으로 로그인하거나, 폴더를 다시 분석하세요.",
+        )
     custom = db.glossary_list()
     rejection = scope.check(
         question, service.store, custom, in_session=(req.session_id or "") in agent.sessions
@@ -147,13 +165,19 @@ def query(req: QueryRequest) -> dict:
         out["history_id"] = db.add_question(req.user.get("name", ""), out["session_id"], out)
         return out
     try:
-        out = agent.ask(question, req.user, req.session_id, custom)
+        with limiter.slot(config.QUEUE_WAIT_SECONDS):  # a free slot, or wait in line
+            out = agent.ask(question, req.user, req.session_id, custom)
         out["data_version"] = (service.sync or {}).get("version")
         out["source_stamps"] = service.stamps_for(
             s["path"] for s in [*(out.get("sources") or []), *(out.get("search_results") or [])]
         )
         out["history_id"] = db.add_question(req.user.get("name", ""), out.get("session_id"), out)
         return out
+    except QueueTimeout as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="지금 질문이 많아 순서를 기다리다 시간이 지났습니다. 잠시 후 다시 질문하세요.",
+        ) from exc
     except (LLMNotConfigured, ApiKeyError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GatewayError as exc:

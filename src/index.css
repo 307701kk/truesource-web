@@ -267,3 +267,6 @@ ul.plain { margin: 0; padding-left: 18px; line-height: 1.7; font-size: 13.5px; }
 .gl-cands .c-files { color: #6b4e00; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gl-cands button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
 .gl-cands button.del { background: #e5e7eb; color: #374151; }
+
+.queue-wrap { display: flex; justify-content: center; margin-top: 6px; }
+.queue-note { margin: 0; padding: 6px 14px; border-radius: 999px; background: #FFF4D6; color: #7a5600; font-size: 13px; }
