@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import unicodedata
@@ -37,6 +38,15 @@ CREATE TABLE IF NOT EXISTS scan_log (
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+_NOT_A_TERM = re.compile(r"^[\d\W_]+$|^\d+\s*(월|분기|주|일|년)$")
+
+
+def suggestable(column: str) -> bool:
+    """Can this column name be offered as a glossary candidate? (not internal, not a bare number/month)"""
+    c = column.strip()
+    return 2 <= len(c) <= 30 and not c.startswith("_") and not _NOT_A_TERM.match(c)
 
 
 def normalize_name(name: str) -> str:
@@ -195,10 +205,19 @@ class CompanyDB:
             for r in self._all("SELECT * FROM file_fp")
         }
 
-    def record_scan(self, path: str, new_fp: dict[str, tuple], sheets: int, data_rows: int) -> dict:
-        """Store the new fingerprints and a sync-log row; returns the diff against the previous scan."""
+    def record_scan(
+        self,
+        path: str,
+        new_fp: dict[str, tuple],
+        sheets: int,
+        data_rows: int,
+        columns: dict[str, list[str]] | None = None,
+    ) -> dict:
+        """Store the new fingerprints and a sync-log row; returns the diff against the previous scan,
+        the data `version` (bumped only when something changed) and the columns never seen before."""
         first = self.get_meta("last_folder") != path or not self.fingerprints()
         diff = diff_fingerprints({} if first else self.fingerprints(), new_fp)
+        changed = first or any(diff.values())
         with self._lock:
             self._con.execute("DELETE FROM file_fp")
             self._con.executemany(
@@ -206,12 +225,16 @@ class CompanyDB:
             )
             self._con.commit()
         self.set_meta("last_folder", path)
+        version = int(self.get_meta("data_version") or 0) + (1 if changed else 0)
+        version = max(version, 1)
+        self.set_meta("data_version", str(version))
+        at = _now()
         self._run(
             "INSERT INTO scan_log(path,finished_at,files,sheets,data_rows,added,modified,deleted,moved,detail)"
             " VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
                 path,
-                _now(),
+                at,
                 len(new_fp),
                 sheets,
                 data_rows,
@@ -222,7 +245,55 @@ class CompanyDB:
                 json.dumps(diff, ensure_ascii=False),
             ),
         )
-        return {"first_scan": first, **{k: len(v) for k, v in diff.items()}, "detail": diff}
+        return {
+            "first_scan": first,
+            **{k: len(v) for k, v in diff.items()},
+            "detail": diff,
+            "version": version,
+            "changed": changed,
+            "at": at,
+            "new_columns": self._track_columns(columns, first),
+        }
+
+    # ---------------------------------------------------------------- new columns -> glossary candidates
+    def _meta_json(self, key: str, default):
+        raw = self.get_meta(key)
+        return json.loads(raw) if raw else default
+
+    def _track_columns(self, columns: dict[str, list[str]] | None, first: bool) -> list[str]:
+        """Remember every column name seen; the ones never seen before (after the first scan of a
+        folder) become glossary candidates."""
+        if columns is None:
+            return []
+        known = self._meta_json("known_columns", None)
+        cands = self._meta_json("col_candidates", {})
+        new: list[str] = []
+        if known is not None and not first:
+            for name, files in columns.items():
+                if name not in known and suggestable(name):
+                    new.append(name)
+                    cands[name] = {"files": sorted(files)[:5], "first_seen": _now()}
+        self.set_meta(
+            "known_columns", json.dumps(sorted({*(known or []), *columns}), ensure_ascii=False)
+        )
+        self.set_meta("col_candidates", json.dumps(cands, ensure_ascii=False))
+        return sorted(new)
+
+    def glossary_candidates(self, covered: set[str], present: set[str]) -> list[dict]:
+        """New columns still worth a glossary entry: not dismissed, not already covered by a glossary
+        entry, and still present in the loaded files."""
+        dismissed = set(self._meta_json("col_dismissed", []))
+        out = []
+        for name, info in self._meta_json("col_candidates", {}).items():
+            if name in dismissed or name.casefold() in covered or name not in present:
+                continue
+            out.append({"column": name, **info})
+        return sorted(out, key=lambda c: c["first_seen"], reverse=True)
+
+    def dismiss_candidate(self, column: str) -> None:
+        dismissed = self._meta_json("col_dismissed", [])
+        if column not in dismissed:
+            self.set_meta("col_dismissed", json.dumps([*dismissed, column], ensure_ascii=False))
 
     def scan_logs(self, limit: int = 20) -> list[dict]:
         rows = self._all("SELECT * FROM scan_log ORDER BY id DESC LIMIT ?", (limit,))

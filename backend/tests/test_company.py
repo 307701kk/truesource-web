@@ -20,7 +20,9 @@ USER = {"company": "㈜가온산업", "name": "홍길동", "dept": "영업팀", 
 def client(tmp_path, monkeypatch):
     svc = ScanService()
     mgr = CompanyManager(tmp_path / "data")
-    svc.on_complete = lambda c, p, fp, sh, rows: mgr.open(c).record_scan(p, fp, sh, rows)
+    svc.on_complete = lambda c, p, fp, sh, rows, **kw: mgr.open(c).record_scan(
+        p, fp, sh, rows, kw.get("columns")
+    )
     monkeypatch.setattr(main, "service", svc)
     monkeypatch.setattr(main, "companies", mgr)
     return TestClient(main.app)

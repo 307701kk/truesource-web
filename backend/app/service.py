@@ -65,7 +65,14 @@ class ScanService:
         }
 
     # ------------------------------------------------------------ control
-    def start(self, raw_path: str, *, background: bool = True, company: str | None = None) -> dict:
+    def start(
+        self,
+        raw_path: str,
+        *,
+        background: bool = True,
+        company: str | None = None,
+        trigger: str = "scan",
+    ) -> dict:
         root = validate_scan_path(raw_path)  # raises ScanPathError
         with self._lock:
             if self._status["state"] == "running":
@@ -82,12 +89,20 @@ class ScanService:
             scan_id = self._scan_id
         if background:
             self._thread = threading.Thread(
-                target=self._run, args=(root, scan_id, company), daemon=True, name="scan"
+                target=self._run, args=(root, scan_id, company, trigger), daemon=True, name="scan"
             )
             self._thread.start()
         else:
-            self._run(root, scan_id, company)
+            self._run(root, scan_id, company, trigger)
         return self.status()
+
+    def sync_now(self) -> dict:
+        """Manual "지금 동기화": re-read the loaded folder even if nothing looks changed."""
+        with self._lock:
+            path, company = self.scanned_path, self.scan_company
+        if not path:
+            raise ScanPathError("먼저 공유폴더를 분석하세요.")
+        return self.start(path, company=company, trigger="manual")
 
     def wait(self, timeout: float | None = None) -> None:
         if self._thread:
@@ -116,7 +131,9 @@ class ScanService:
                 self._status["errors"].append({"file": rel, "message": msg})
 
     # ------------------------------------------------------------ the scan
-    def _run(self, root: Path, scan_id: int, company: str | None = None) -> None:
+    def _run(
+        self, root: Path, scan_id: int, company: str | None = None, trigger: str = "scan"
+    ) -> None:
         try:
             listing = list_excel_files(root)
             self._update(files_total=len(listing.files), skipped=dict(listing.skipped))
@@ -124,6 +141,8 @@ class ScanService:
                 self._warn(w)
             store = self._load(listing)
             sync = self._finish_sync(company, root, store)
+            if sync:
+                sync["trigger"] = trigger
             with self._lock:
                 self.store = store
                 self.scanned_path = str(root)
@@ -154,8 +173,16 @@ class ScanService:
             for r in store.query("SELECT rel_path, size, modified, sha256 FROM files")
         }
         st = self.status()
+        columns: dict[str, list[str]] = {}
+        for name, rel in store.query(
+            "SELECT DISTINCT c.name, f.rel_path FROM columns c"
+            " JOIN sheets s ON s.table_name = c.table_name JOIN files f ON f.file_id = s.file_id"
+        ):
+            columns.setdefault(name, []).append(rel)
         try:
-            return self.on_complete(company, str(root), fp, st["sheets"], st["data_rows"])
+            return self.on_complete(
+                company, str(root), fp, st["sheets"], st["data_rows"], columns=columns
+            )
         except Exception:  # a storage problem must not fail the scan itself
             log.exception("could not record scan for company")
             return None
@@ -178,7 +205,7 @@ class ScanService:
         if {f.rel_path: (f.size, f.mtime) for f in listing.files} == last:
             return False
         try:
-            self.start(path, company=company)
+            self.start(path, company=company, trigger="auto")
         except (ScanBusyError, ScanPathError):
             return False
         return True
@@ -329,6 +356,38 @@ class ScanService:
             )
         base.update(total=len(files), files=files)
         return base
+
+    def column_names(self) -> set[str]:
+        store = self.store
+        return {r[0] for r in store.query("SELECT DISTINCT name FROM columns")} if store else set()
+
+    def stamps_for(self, paths) -> dict[str, str]:
+        """{path: sha256[:12]} of the files an answer was built from (to spot later changes)."""
+        store = self.store
+        if store is None:
+            return {}
+        sha = {r[0]: r[1] for r in store.query("SELECT rel_path, sha256 FROM files")}
+        return {p: sha[p][:12] for p in dict.fromkeys(paths) if sha.get(p)}
+
+    def check_stamps(self, stamps: dict[str, str]) -> dict[str, dict]:
+        """Compare stamps of an old answer with the files now loaded:
+        ok | changed (same path, new content) | moved (same content elsewhere) | deleted."""
+        store = self.store
+        sha = (
+            {r[0]: (r[1] or "")[:12] for r in store.query("SELECT rel_path, sha256 FROM files")}
+            if store
+            else {}
+        )
+        by_sha = {v: k for k, v in sha.items() if v}
+        out: dict[str, dict] = {}
+        for path, stamp in stamps.items():
+            if path in sha:
+                out[path] = {"status": "ok" if sha[path] == stamp else "changed"}
+            elif stamp in by_sha:
+                out[path] = {"status": "moved", "to": by_sha[stamp]}
+            else:
+                out[path] = {"status": "deleted"}
+        return out
 
     def file_detail(self, file_id: int) -> dict | None:
         store, scanned_path, status = self._snapshot()

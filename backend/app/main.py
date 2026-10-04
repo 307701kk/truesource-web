@@ -14,6 +14,7 @@ from pydantic import BaseModel
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")  # backend/.env (GEMINI_API_KEY ...)
 
 from . import config  # noqa: E402
+from .agent import scope  # noqa: E402
 from .agent.gateway import ApiKeyError, Gateway, GatewayError, LLMNotConfigured  # noqa: E402
 from .agent.runner import Agent  # noqa: E402
 from .companydb import CompanyManager  # noqa: E402
@@ -49,9 +50,10 @@ gateway = Gateway()
 agent = Agent(service, gateway)
 
 
-def _record_scan(company: str, path: str, fp: dict, sheets: int, rows: int) -> dict:
-    db = companies.open(company)
-    return db.record_scan(path, fp, sheets, rows)
+def _record_scan(
+    company: str, path: str, fp: dict, sheets: int, rows: int, columns: dict | None = None
+) -> dict:
+    return companies.open(company).record_scan(path, fp, sheets, rows, columns)
 
 
 service.on_complete = _record_scan
@@ -136,14 +138,47 @@ def query(req: QueryRequest) -> dict:
     if service.store is None:
         raise HTTPException(status_code=409, detail="먼저 공유폴더를 분석하세요.")
     db = _company(req.user.get("company"))
+    custom = db.glossary_list()
+    rejection = scope.check(
+        question, service.store, custom, in_session=(req.session_id or "") in agent.sessions
+    )
+    if rejection:  # nothing to do with the loaded files: answer without calling the LLM
+        out = scope.build_response(question, req.session_id, service.store, rejection)
+        out["history_id"] = db.add_question(req.user.get("name", ""), out["session_id"], out)
+        return out
     try:
-        out = agent.ask(question, req.user, req.session_id, db.glossary_list())
+        out = agent.ask(question, req.user, req.session_id, custom)
+        out["data_version"] = (service.sync or {}).get("version")
+        out["source_stamps"] = service.stamps_for(
+            s["path"] for s in [*(out.get("sources") or []), *(out.get("search_results") or [])]
+        )
         out["history_id"] = db.add_question(req.user.get("name", ""), out.get("session_id"), out)
         return out
     except (LLMNotConfigured, ApiKeyError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GatewayError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/sync")
+def sync_now() -> dict:
+    """Manual "지금 동기화": re-read the loaded folder now. Poll GET /api/scan/status."""
+    try:
+        return service.sync_now()
+    except ScanPathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ScanBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+class StampsRequest(BaseModel):
+    stamps: dict[str, str]
+
+
+@app.post("/api/sources/check")
+def sources_check(req: StampsRequest) -> dict:
+    """Have the files an old answer was built from changed since? {path: {status, to?}}"""
+    return {"items": service.check_stamps(req.stamps)}
 
 
 @app.get("/api/audit")
@@ -218,6 +253,29 @@ def glossary_list(company: str) -> dict:
     from .agent.glossary import GLOSSARY
 
     return {"seed": GLOSSARY, "custom": _company(company).glossary_list()}
+
+
+@app.get("/api/glossary/candidates")
+def glossary_candidates(company: str) -> dict:
+    """Columns that appeared in a later scan and are not in any glossary entry yet."""
+    from .agent.glossary import GLOSSARY
+
+    db = _company(company)
+    covered = {
+        c.casefold() for g in [*GLOSSARY, *db.glossary_list()] for c in [g["term"], *g["columns"]]
+    }
+    return {"items": db.glossary_candidates(covered, service.column_names())}
+
+
+class DismissRequest(BaseModel):
+    company: str
+    column: str
+
+
+@app.post("/api/glossary/candidates/dismiss")
+def glossary_candidate_dismiss(req: DismissRequest) -> dict:
+    _company(req.company).dismiss_candidate(req.column)
+    return {"ok": True}
 
 
 @app.post("/api/glossary")

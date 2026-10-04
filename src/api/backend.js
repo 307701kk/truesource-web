@@ -44,3 +44,9 @@ export const deleteGlossary = (company, id) => request(`/api/glossary/${id}?${qs
 
 // 근거 파일을 이 PC의 엑셀로 연다 (분석된 파일만 가능)
 export const openFile = (path) => request('/api/open', json('POST', { path }))
+
+// 동기화: 지금 다시 읽기, 새로 생긴 컬럼(용어사전 후보), 답변 근거 파일이 그 뒤에 바뀌었는지
+export const syncNow = () => request('/api/sync', { method: 'POST' })
+export const getGlossaryCandidates = (company) => request(`/api/glossary/candidates?${qs({ company })}`)
+export const dismissCandidate = (company, column) => request('/api/glossary/candidates/dismiss', json('POST', { company, column }))
+export const checkSources = (stamps) => request('/api/sources/check', json('POST', { stamps }))

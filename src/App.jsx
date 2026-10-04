@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Sidebar from './components/Sidebar'
 import QuestionBar from './components/QuestionBar'
 import ResultView from './components/ResultView'
@@ -10,7 +10,8 @@ import { OpenFileProvider } from './components/OpenFile'
 import Loading3D from './components/Loading3D'
 import ErrorBoundary from './components/ErrorBoundary'
 import GlossaryView from './components/GlossaryView'
-import { getCatalog, getLlmCheck, login } from './api/backend'
+import SyncNotice from './components/SyncNotice'
+import { getCatalog, getGlossaryCandidates, getLlmCheck, getScanStatus, login, syncNow } from './api/backend'
 
 // 프로필·폴더 경로는 브라우저에 기억한다 (DB는 백엔드 메모리라 재시작하면 다시 분석해야 함)
 const STORE_KEY = 'truesource.setup'
@@ -32,6 +33,9 @@ export default function App() {
   const [sessionId, setSessionId] = useState(null) // 대화 맥락("그럼 2위는?")을 잇는 세션
   const [view, setView] = useState('ask') // ask | audit
   const [keyProblem, setKeyProblem] = useState(null) // Gemini 키 점검 결과가 나쁠 때의 안내 문구
+  const [syncing, setSyncing] = useState(false)
+  const [syncNotice, setSyncNotice] = useState(null) // { sync, newColumns } — 폴더가 바뀌었을 때 알림
+  const seenVersion = useRef(null) // 사용자가 이미 본 자료 버전 (처음 입장할 때 값으로 시작)
 
   // 새로고침해도 백엔드가 이미 분석을 끝낸 상태면 시작 화면을 건너뛴다
   useEffect(() => {
@@ -41,6 +45,7 @@ export default function App() {
       .then((c) => {
         // 이 회사의 폴더가 이미 분석돼 있을 때만 바로 입장 (다른 회사 데이터면 시작 화면)
         if (c.state === 'done' && c.total > 0 && c.company === saved.profile.company) {
+          seenVersion.current = c.sync?.version ?? null
           setSetup({ profile: saved.profile, path: c.scanned_path, catalog: c })
         }
       })
@@ -57,11 +62,47 @@ export default function App() {
     if (!setup) return undefined
     const timer = setInterval(() => {
       getCatalog().then((c) => {
-        if (c.company === setup.profile.company && c.total > 0) setSetup((cur) => (cur ? { ...cur, catalog: c } : cur))
+        if (c.company === setup.profile.company && c.total > 0) applyCatalog(c)
       }).catch(() => {})
     }, 30000)
     return () => clearInterval(timer)
   }, [setup?.profile.company]) // eslint-disable-line
+
+  // 새 카탈로그를 화면에 반영하고, 자료 버전이 올라갔으면(자동·수동 동기화 모두) 변경 알림을 띄운다
+  function applyCatalog(c) {
+    setSetup((cur) => (cur ? { ...cur, catalog: c } : cur))
+    const s = c.sync
+    if (!s?.version) return
+    if (seenVersion.current == null) { seenVersion.current = s.version; return }
+    if (s.version > seenVersion.current) {
+      seenVersion.current = s.version
+      if (s.changed && !s.first_scan) {
+        getGlossaryCandidates(c.company).then((r) => r.items.length).catch(() => 0)
+          .then((newColumns) => setSyncNotice({ sync: s, newColumns }))
+      }
+    }
+  }
+
+  // "지금 동기화": 폴더를 바로 다시 읽고 끝나면 카탈로그를 갱신한다
+  async function handleSync() {
+    setSyncing(true)
+    setError(null)
+    try {
+      await syncNow()
+      for (let i = 0; i < 240; i += 1) {
+        await new Promise((r) => setTimeout(r, 1000))
+        const st = await getScanStatus()
+        if (st.state !== 'running') break
+      }
+      const c = await getCatalog()
+      applyCatalog(c)
+      if (c.sync && !c.sync.changed) setSyncNotice({ sync: c.sync, newColumns: 0 })
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setSyncing(false)
+    }
+  }
 
   // 키가 실제로 쓸 수 있는지 점검한다. 키 오류면 화면 위에 눈에 띄게 알린다.
   function checkKey(force) {
@@ -72,6 +113,8 @@ export default function App() {
 
   function handleSetupDone(profile, path, catalog) {
     save({ profile, path })
+    seenVersion.current = catalog?.sync?.version ?? null
+    setSyncNotice(null)
     setSetup({ profile, path, catalog })
     setResult(null)
     setSessionId(null)
@@ -101,6 +144,17 @@ export default function App() {
     return new Set(paths.filter(Boolean))
   }, [result])
 
+  // 방금 동기화로 바뀐 파일: { 경로 → added | modified | moved } (사이드바 강조용)
+  const changedFiles = useMemo(() => {
+    const m = new Map()
+    const d = syncNotice?.sync?.detail
+    if (!d) return m
+    d.added?.forEach((p) => m.set(p, 'added'))
+    d.modified?.forEach((p) => m.set(p, 'modified'))
+    d.moved?.forEach((x) => m.set(x.to, 'moved'))
+    return m
+  }, [syncNotice])
+
   if (booting) return null
   if (!setup) {
     return <SetupScreen initialProfile={saved.profile} initialPath={saved.path ?? ''} onDone={handleSetupDone} />
@@ -112,6 +166,9 @@ export default function App() {
       <Sidebar
         catalog={setup.catalog.files}
         sync={setup.catalog.sync}
+        changed={changedFiles}
+        syncing={syncing}
+        onSync={handleSync}
         usedFiles={usedFiles}
         profile={setup.profile}
         onChangeFolder={() => setSetup(null)}
@@ -125,13 +182,14 @@ export default function App() {
             <button onClick={() => checkKey(true)}>다시 확인</button>
           </div>
         )}
+        {syncNotice && <SyncNotice notice={syncNotice} onGlossary={() => setView('glossary')} onClose={() => setSyncNotice(null)} />}
         {view === 'audit' && <div className="content"><AuditView /></div>}
         {view === 'history' && (
           <div className="content">
             <HistoryView profile={setup.profile} onOpen={(res) => { setResult(res); setError(null); setView('ask') }} />
           </div>
         )}
-        {view === 'glossary' && <div className="content"><GlossaryView profile={setup.profile} /></div>}
+        {view === 'glossary' && <div className="content"><GlossaryView profile={setup.profile} version={setup.catalog.sync?.version} /></div>}
         {view === 'ask' && (<>
         <QuestionBar onAsk={handleAsk} loading={loading} />
         <div className="content">
@@ -142,7 +200,7 @@ export default function App() {
           )}
           {!loading && !error && result && (
             <ErrorBoundary key={result.question_id} data={result}>
-              <ResultView data={result} onAsk={handleAsk} />
+              <ResultView data={result} onAsk={handleAsk} dataVersion={setup.catalog.sync?.version} />
             </ErrorBoundary>
           )}
         </div>
