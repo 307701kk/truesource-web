@@ -163,3 +163,16 @@ def test_data_survives_restart(tmp_path):
 def test_query_requires_company(client):
     res = client.post("/api/query", json={"question": "안녕", "user": {"name": "홍"}})
     assert res.status_code in (400, 409)
+
+
+def test_company_db_avoids_the_file_creating_rollback_journal(tmp_path):
+    """On some drives (exFAT disks) SQLite's default rollback journal fails from the second write
+    with 'attempt to write a readonly database'. WAL / memory journals do not."""
+    db = CompanyManager(tmp_path).open("㈜가온산업")
+    assert db.journal_mode in ("wal", "memory")
+    for i in range(50):  # many small writes, like questions being saved one after another
+        db.add_question("홍", "s", {"question": f"q{i}", "type": "질문형", "answer": "a"})
+    assert len(db.recent_questions(limit=100)) == 50
+    # the database written in WAL mode is still found and complete after a "restart"
+    again = CompanyManager(tmp_path).open("㈜가온산업")
+    assert len(again.recent_questions(limit=100)) == 50
