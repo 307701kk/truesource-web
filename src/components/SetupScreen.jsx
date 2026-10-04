@@ -1,3 +1,4 @@
+import BrandIcon from './BrandIcon'
 import { useEffect, useRef, useState } from 'react'
 import { getCatalog, getScanStatus, login, startScan } from '../api/backend'
 import { DEPT_ORDER } from '../constants'
@@ -25,7 +26,7 @@ export default function SetupScreen({ initialProfile, initialPath, onDone }) {
   return (
     <div className="setup">
       <div className="setup-card">
-        <div className="brand">트루소스<small>TrueSource</small></div>
+        <div className="brand"><BrandIcon size={30} tone="dark" /><span>트루소스<small>TrueSource</small></span></div>
         {step === 'profile' ? (
           <ProfileForm initial={profile} onSubmit={saveProfile} />
         ) : (
