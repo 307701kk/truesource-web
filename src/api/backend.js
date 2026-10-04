@@ -32,6 +32,7 @@ export const getCatalog = () => request('/api/catalog')
 export const getAudit = () => request('/api/audit?limit=200')
 export const getLlmStatus = () => request('/api/llm/status')
 // Gemini 키가 실제로 쓸 수 있는지 점검 (작은 테스트 호출 1회, 5분 캐시). { ok, kind, message }
+export const getQueue = () => request('/api/queue')
 export const getLlmCheck = (force = false) => request(`/api/llm/check${force ? '?force=true' : ''}`)
 
 // 회사별 DB: 최근 질문, 용어사전, 동기화 로그

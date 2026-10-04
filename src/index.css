@@ -261,3 +261,7 @@ ul.plain { margin: 0; padding-left: 18px; line-height: 1.7; font-size: 13.5px; }
 /* 로고 */
 .brand { display: flex; align-items: center; gap: 10px; }
 .brand-icon { flex: none; }
+
+/* 대기 안내 */
+.queue-wrap { display: flex; justify-content: center; margin-top: 6px; }
+.queue-note { margin: 0; padding: 6px 14px; border-radius: 999px; background: #FFF4D6; color: #7a5600; font-size: 13px; }

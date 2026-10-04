@@ -83,11 +83,26 @@ class CompanyDB:
         self._lock = threading.RLock()
         self._con = sqlite3.connect(path, check_same_thread=False)
         self._con.row_factory = sqlite3.Row
+        self.journal_mode = self._pick_journal_mode(self._con)
         with self._lock:
             self._con.executescript(_DDL)
             if self.get_meta("name") is None:
                 self.set_meta("name", name)
                 self.set_meta("created_at", _now())
+
+    @staticmethod
+    def _pick_journal_mode(con: sqlite3.Connection) -> str:
+        """SQLite's default rollback journal creates and deletes a file on every write. Some drives
+        (e.g. an exFAT external disk) fail that with "attempt to write a readonly database" from the
+        second write on. WAL (and, failing that, an in-memory journal) never does."""
+        for mode in ("WAL", "MEMORY"):
+            try:
+                got = con.execute(f"PRAGMA journal_mode={mode}").fetchone()[0]
+            except sqlite3.DatabaseError:
+                continue
+            if str(got).upper() == mode:
+                return mode.lower()
+        return "delete"
 
     def _run(self, sql: str, params=()) -> sqlite3.Cursor:
         with self._lock:
