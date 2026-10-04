@@ -189,30 +189,10 @@ ul.plain { margin: 0; padding-left: 18px; line-height: 1.7; font-size: 13.5px; }
 /* 화면에서 크게 보이도록 장면 전체를 키운다(상자는 키운 크기만큼 자리를 차지) */
 .loading3d .scene-box { width: 300px; height: 262px; display: flex; justify-content: center; }
 .loading3d .scene-box > .scene { transform: scale(2); transform-origin: top center; flex: none; }
-.loading3d .scene { --size: 64px; position: relative; width: 150px; height: 130px; perspective: 700px; perspective-origin: 50% 40%; }
-.loading3d .cube { position: absolute; left: 50%; top: 34px; width: var(--size); height: var(--size); margin-left: calc(var(--size) / -2); transform-style: preserve-3d; animation: cube-spin 7s linear infinite; }
-.loading3d .cube.inner { --size: 26px; top: 53px; animation: cube-spin-rev 4.5s linear infinite; }
-.loading3d .face { position: absolute; inset: 0; border: 1.5px solid rgba(46, 90, 172, .75); background: linear-gradient(135deg, rgba(46, 90, 172, .22), rgba(120, 170, 255, .08)); box-shadow: inset 0 0 14px rgba(46, 90, 172, .25); backface-visibility: visible; }
-.loading3d .inner .face { background: linear-gradient(135deg, rgba(30, 128, 116, .9), rgba(76, 195, 138, .75)); border-color: rgba(255, 255, 255, .7); box-shadow: 0 0 10px rgba(30, 128, 116, .5); }
-.loading3d .front  { transform: translateZ(calc(var(--size) / 2)); }
-.loading3d .back   { transform: rotateY(180deg) translateZ(calc(var(--size) / 2)); }
-.loading3d .right  { transform: rotateY(90deg) translateZ(calc(var(--size) / 2)); }
-.loading3d .left   { transform: rotateY(-90deg) translateZ(calc(var(--size) / 2)); }
-.loading3d .top    { transform: rotateX(90deg) translateZ(calc(var(--size) / 2)); }
-.loading3d .bottom { transform: rotateX(-90deg) translateZ(calc(var(--size) / 2)); }
-.loading3d .ring { position: absolute; left: 50%; top: 66px; width: 124px; height: 124px; margin: -62px 0 0 -62px; border-radius: 50%; border: 2.5px solid transparent; border-top-color: var(--accent); border-bottom-color: rgba(46, 90, 172, .35); transform-style: preserve-3d; }
-.loading3d .ring-a { animation: ring-a 2.6s linear infinite; }
-.loading3d .ring-b { width: 100px; height: 100px; margin: -50px 0 0 -50px; border-top-color: #1E8074; border-bottom-color: rgba(30, 128, 116, .25); animation: ring-b 3.4s linear infinite; }
-.loading3d .shadow { position: absolute; left: 50%; bottom: 0; width: 80px; height: 14px; margin-left: -40px; border-radius: 50%; background: radial-gradient(closest-side, rgba(27, 42, 74, .35), transparent); animation: shadow-pulse 3.5s ease-in-out infinite; }
 .loading3d .loading-text { margin: 6px 0 0; font-size: 22px; letter-spacing: -0.3px; font-weight: 600; color: var(--navy); }
 .loading3d small { color: #7a8599; font-size: 13.5px; text-align: center; max-width: 420px; line-height: 1.5; }
-@keyframes cube-spin { from { transform: rotateX(-25deg) rotateY(0deg); } to { transform: rotateX(335deg) rotateY(360deg); } }
-@keyframes cube-spin-rev { from { transform: rotateX(20deg) rotateY(360deg) rotateZ(0deg); } to { transform: rotateX(-340deg) rotateY(0deg) rotateZ(360deg); } }
-@keyframes ring-a { from { transform: rotateX(70deg) rotateZ(0deg); } to { transform: rotateX(70deg) rotateZ(360deg); } }
-@keyframes ring-b { from { transform: rotateX(70deg) rotateY(55deg) rotateZ(360deg); } to { transform: rotateX(70deg) rotateY(55deg) rotateZ(0deg); } }
-@keyframes shadow-pulse { 0%, 100% { transform: scale(1); opacity: .9; } 50% { transform: scale(.7); opacity: .5; } }
 @media (prefers-reduced-motion: reduce) {
-  .loading3d .cube, .loading3d .ring, .loading3d .shadow { animation-duration: 24s; }
+  .loading3d .icon3d, .loading3d .icon3d-wrap, .loading3d .shadow { animation-duration: 24s; }
 }
 @media (prefers-color-scheme: dark) { .loading3d .loading-text { color: #dfe6f3; } }
 
@@ -267,3 +247,17 @@ ul.plain { margin: 0; padding-left: 18px; line-height: 1.7; font-size: 13.5px; }
 .gl-cands .c-files { color: #6b4e00; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gl-cands button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
 .gl-cands button.del { background: #e5e7eb; color: #374151; }
+
+/* 입체 트루소스 아이콘 (돋보기+체크를 겹겹이 쌓아 두께를 줌) */
+.loading3d .scene { --s: 100px; position: relative; width: 150px; height: 130px; perspective: 800px; perspective-origin: 50% 35%; }
+.loading3d .icon3d-wrap { position: absolute; left: 50%; top: 6px; width: var(--s); height: var(--s); margin-left: calc(var(--s) / -2); transform-style: preserve-3d; animation: icon-bob 2.6s ease-in-out infinite; }
+.loading3d .icon3d { position: absolute; inset: 0; transform-style: preserve-3d; animation: icon-spin 4.6s linear infinite; }
+.loading3d .icon3d svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.loading3d .shadow { position: absolute; left: 50%; bottom: 2px; width: 84px; height: 14px; margin-left: -42px; border-radius: 50%; background: radial-gradient(closest-side, rgba(27, 42, 74, .38), transparent); animation: shadow-pulse 2.6s ease-in-out infinite; }
+@keyframes icon-spin { from { transform: rotateX(-12deg) rotateY(0deg); } to { transform: rotateX(-12deg) rotateY(360deg); } }
+@keyframes icon-bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+@keyframes shadow-pulse { 0%, 100% { transform: scale(1); opacity: .9; } 50% { transform: scale(.72); opacity: .5; } }
+
+/* 로고 */
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-icon { flex: none; }

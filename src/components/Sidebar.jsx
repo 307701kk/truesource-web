@@ -1,3 +1,4 @@
+import BrandIcon from './BrandIcon'
 import { useEffect, useMemo, useState } from 'react'
 import { DEPT_ORDER, SORT_MODES } from '../constants'
 import { useOpenFile } from './openFileContext'
@@ -136,7 +137,7 @@ export default function Sidebar({ catalog, sync, changed, syncing, onSync, usedF
 
   return (
     <aside className="sidebar">
-      <div className="brand">트루소스<small>TrueSource</small></div>
+      <div className="brand"><BrandIcon size={30} tone="light" /><span>트루소스<small>TrueSource</small></span></div>
       <nav className="nav">
         <button className={view === 'ask' ? 'active' : ''} onClick={() => onNav('ask')}>질문하기</button>
         <button className={view === 'history' ? 'active' : ''} onClick={() => onNav('history')}>최근 질문</button>
