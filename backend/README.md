@@ -1,6 +1,6 @@
 # TrueSource Backend
 
-> 에이전트(질문 처리) 동작 방식은 [루트 README](../README.md#에이전트가-굴러가는-방식) 참고. 아래는 데이터 계층 설명이며, `.env`(`GEMINI_API_KEY`)는 `.env.example`을 복사해 만든다.
+> 에이전트(질문 처리) 동작 방식은 [루트 README](../README.md#기술-구조) 참고. 아래는 데이터 계층 설명이며, `.env`(`GEMINI_API_KEY`)는 `.env.example`을 복사해 만든다.
 
 공유폴더 경로를 받아 엑셀(xlsx/xlsm)을 스캔 → 시트별 표로 변환 → 인메모리 DuckDB에 저장.
 원본 엑셀은 읽기 전용으로만 열고 수정하지 않음.
